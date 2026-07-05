@@ -26,9 +26,9 @@ real `~/.zsh/.env` is never sourced.
 
 | File | Purpose |
 |---|---|
-| `tackle.bats` | The suite — 57 cases across creation, guards, `.env` copy, `node_modules` symlink + non-JS skip, the kept `gwt` alias, `--done`, PR resolution (number/URL/multi-PR fzf picker), the cross-repo guard for PR URLs (`--repo-check`/`TACKLE_REPO_CHECK` local/remote/off + normalization + gh fallback), the review + prefill-prompt flow (`TACKLE_PROMPT`/`--review`/`--prompt` precedence, `--add`/`--before`/`--after`, template vars, `--flag=value` forms), branch fetch-from-origin, env-file precedence, and the `--time` prefix. |
-| `helpers.bash` | Shared setup: hermetic stubs, `init_repo`, recording-agent helper. |
-| `tackle_zsh_smoke.sh` | Runs a create + `--done` cycle under **zsh** (bats only covers bash). |
+| `tackle.bats` | The suite — 70 cases across creation, guards, `.env` copy, the **dependency registry** (per-ecosystem symlink-vs-install decision: npm/yarn identical-lockfile symlink, differing-lockfile install, `--install` force, pnpm default-install + hoisted opt-in, JS family exclusivity, multilingual install, empty-`node_modules`/Bazel short-circuit, Python `.venv` never symlinked, `--no-deps`/`TACKLE_DEPS=off`) + non-JS skip, the kept `gwt` alias, `--done`, PR resolution (number/URL/multi-PR fzf picker), the cross-repo guard for PR URLs (`--repo-check`/`TACKLE_REPO_CHECK` local/remote/off + normalization + gh fallback), the review + prefill-prompt flow (`TACKLE_PROMPT`/`--review`/`--prompt` precedence, `--add`/`--before`/`--after`, template vars, `--flag=value` forms), branch fetch-from-origin, env-file precedence, and the `--time` prefix. |
+| `helpers.bash` | Shared setup: hermetic stubs (incl. `write_install_stub` for package managers), `init_repo`, recording-agent helper. |
+| `tackle_zsh_smoke.sh` | Runs a create + `--done` cycle **and** a dependency-registry symlink case under **zsh** (bats only covers bash) — guards the registry's array/`read`/`${//}` splitting against zsh word-split differences. |
 | `run.sh` | Runs both. |
 
 ## Why a separate zsh smoke test?

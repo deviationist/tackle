@@ -30,7 +30,8 @@ tackle <branch> --no-agent           # create worktree + install deps, no agent
 tackle <branch> -na                  # same as --no-agent
 tackle --new <branch>                # create a NEW branch off HEAD, then same
 tackle -n <branch> --base <ref>      # create a new branch off <ref> (short: -n / -b)
-tackle <branch> --install            # force full install even if lockfile unchanged
+tackle <branch> --install            # force isolated install even if lockfile unchanged
+tackle <branch> --no-deps            # skip all dependency handling (no symlink, no install)
 tackle <branch> --no-env             # skip copying unversioned .env files into the worktree
 tackle <branch> --time               # prefix each step with a [HH:MM:SS] timestamp
 tackle <PR-url> --repo-check remote  # verify the URL's repo vs this checkout via gh
@@ -74,13 +75,53 @@ worst. tackle catches this up front. Modes:
 Bare PR *numbers* carry no repo info and always skip the guard. Select per-run
 with `--repo-check=<mode>` or persistently with `TACKLE_REPO_CHECK`.
 
-**Dependency install behaviour:** if the main repo has a `node_modules`
-directory, it is symlinked into the worktree — near-instant regardless of whether
-the lockfiles match. Two warnings are printed: one that dep mutations here affect
-the main repo, and (if lockfiles differ) one that some deps may be missing. Pass
-`--install` to force a full isolated install instead. The symlink is also
-silently added to `.git/info/exclude` so git doesn't show it as an untracked
-file.
+**Dependency behaviour (language-agnostic):** tackle detects **every** package
+manager present in the worktree — so multilingual repos are handled, not just the
+first ecosystem found. For each one it makes a per-ecosystem decision driven by the
+**lockfile**, which is the reliable, cross-language signal for "did deps change on
+this branch" (never a comparison of the installed tree):
+
+- **Reuse (symlink) — instant, zero-copy** — used only when *all* hold: the
+  ecosystem's install dir is safely shareable by a plain root symlink (flat trees:
+  npm/yarn), the lockfile(s) are byte-identical between the main repo and the
+  worktree, and the main tree exists and is non-empty. The symlink is added to
+  `.git/info/exclude` so git doesn't show it as untracked. A warning notes that dep
+  mutations here (e.g. adding a package) affect the shared main-repo tree.
+- **Install** — used otherwise (lockfile differs, or the layout isn't safely
+  root-symlinkable). tackle runs the ecosystem's own install command, which is fast
+  off its warm global cache (pnpm hardlinks, cargo/go/pip caches — no re-download).
+
+The registry (add a package manager = add a row):
+
+| Ecosystem | Detected by | Reuse dir | Root-symlinkable? | Install |
+|---|---|---|---|---|
+| pnpm | `pnpm-lock.yaml` | `node_modules` | No¹ | `pnpm i` |
+| yarn | `yarn.lock` | `node_modules` | Yes | `yarn` |
+| npm | `package-lock.json` / `package.json` | `node_modules` | Yes | `npm i` |
+| Rust (cargo) | `Cargo.lock` | `target` | No² | `cargo fetch` |
+| Go | `go.sum` | — | No² | `go mod download` |
+| Python (poetry) | `poetry.lock` | `.venv` | No³ | `poetry install` |
+| Python (uv) | `uv.lock` | `.venv` | No³ | `uv sync` |
+| Python (pip) | `requirements.txt` | `.venv` | No³ | `pip install -r requirements.txt` |
+
+¹ pnpm's strict/nested `node_modules` (one root + one per workspace package) isn't
+fully materialised by a single root symlink, so pnpm defaults to install. Opt in to
+symlink-reuse for known-flat layouts with `TACKLE_PNPM_SYMLINK=true`, or a
+`node-linker=hoisted` line in `.npmrc` / `nodeLinker: hoisted` in
+`pnpm-workspace.yaml`. ² cargo/go materialise from a shared global cache, so a
+build in the worktree is already fast; there's no in-tree tree worth symlinking.
+³ Python virtualenvs bake absolute paths and are never relocatable, so they are
+never symlinked.
+
+**Bazel workspaces** (`MODULE.bazel` / `WORKSPACE` / `WORKSPACE.bazel`) skip in-tree
+dependency handling entirely: Bazel owns out-of-tree caches (e.g.
+`~/Library/Caches/bazel`) and the in-tree `node_modules`/`.venv`/`target` are empty
+by design, so there's nothing to reuse or install.
+
+Pass `--install` to force a fully isolated install even when a symlink would be
+valid, or `--no-deps` (or `TACKLE_DEPS=off`) to skip dependency handling entirely.
+*Known limitation:* only **root-level** lockfiles are compared; nested per-package
+workspace lockfiles are out of scope.
 
 **`.env` copy behaviour:** `git worktree add` only materialises *tracked* files,
 so gitignored secrets like `.env` would be missing and the app couldn't build or
@@ -209,6 +250,8 @@ for success (`✓`), yellow for warnings (`⚠`), red for errors (`✗`) on stde
 | `TACKLE_DIR_TEMPLATE` | `{repo}_{branch}` | Worktree directory name template; placeholders: `{repo}` `{branch}` `{input}` |
 | `TACKLE_PROMPT` | _(none)_ | Default prompt; overridden by `--prompt` / `--review`; extended by `--add` |
 | `TACKLE_REPO_CHECK` | `local` | Cross-repo guard for PR URLs: `local` / `remote` / `off` |
+| `TACKLE_DEPS` | `on` | Set `off` to skip all dependency handling (same as `--no-deps` on every run) |
+| `TACKLE_PNPM_SYMLINK` | _(unset)_ | Set `true` to allow symlink-reuse of a pnpm `node_modules` (only safe for flat/hoisted pnpm layouts) |
 | `TACKLE_ENV_FILE` | _(script dir)/.env_ | Path to an env file to source at startup; see below |
 | `TACKLE_COPY_ENV` | `true` | Copy unversioned `.env`/`.env.*` files into the worktree; set `false` (or pass `--no-env`) to skip |
 
@@ -254,8 +297,10 @@ tackle feature/my-branch --no-agent
 ## Requirements
 
 Compatible with bash and zsh — source from `.bashrc` or `.zshrc`. Requires `git`,
-`python3`, and the configured agent binary in `PATH`; the package manager is
-auto-detected (pnpm/yarn/npm, skipped in non-JS repos). `gh` unlocks PR
+`python3`, and the configured agent binary in `PATH`. Dependency handling is
+language-agnostic: the registry covers JS (pnpm/yarn/npm), Rust, Go, and Python,
+plus Bazel-awareness (see *Dependency behaviour* above); whichever package
+managers a repo uses must be on `PATH` for the install path to run. `gh` unlocks PR
 resolution and the `remote` cross-repo check; `fzf` unlocks the multi-PR picker.
 
 ## Tests

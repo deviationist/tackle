@@ -11,7 +11,8 @@
 #   tackle <branch> -na                  # same as --no-agent
 #   tackle --new <branch>                # create a NEW branch (off HEAD) + worktree
 #   tackle -n <branch> --base <ref>      # create a new branch off <ref> (short forms)
-#   tackle <branch> --install            # force full install even if lockfile unchanged
+#   tackle <branch> --install            # force isolated install even if lockfile unchanged
+#   tackle <branch> --no-deps            # skip all dependency handling (no symlink, no install)
 #   tackle <branch> --no-env             # skip copying unversioned .env files into the worktree
 #   tackle <branch> --time               # prefix each step with a [HH:MM:SS] timestamp
 #   tackle <PR-url> --repo-check remote  # verify the URL's repo vs this checkout via gh (see below)
@@ -24,8 +25,17 @@
 #   tackle --close                       # alias for --done
 #   tackle --exit                        # alias for --done
 #
-# When the main repo has node_modules, it is symlinked into the worktree (instant).
-# Pass --install to force a real isolated install instead.
+# Dependency handling is per-ecosystem and language-agnostic (see the registry in
+# _tackle_setup_deps). For each package manager detected in the worktree, tackle
+# byte-compares the lockfile(s) against the main repo. It symlinks the main repo's
+# install dir into the worktree ONLY when that dir is safely shareable by a plain
+# root symlink (flat trees: npm/yarn) AND the lockfiles are identical AND the main
+# tree is non-empty — instant, zero-copy. Otherwise it runs that ecosystem's own
+# install command (fast off the warm global cache). pnpm defaults to install (its
+# strict/nested node_modules isn't safely root-symlinkable); opt in with
+# TACKLE_PNPM_SYMLINK=true or a node-linker=hoisted config. Bazel workspaces
+# (MODULE.bazel/WORKSPACE) skip in-tree reuse entirely (Bazel owns out-of-tree
+# caches). Pass --install to force an isolated install; --no-deps to skip entirely.
 #
 # Unversioned .env files in the main repo are copied into the worktree (git only
 # checks out tracked files, so gitignored secrets would otherwise be missing).
@@ -42,6 +52,10 @@
 #                      Overridden by --prompt / --review flags.
 #                      Tip: agents with slash commands can use a skill name:
 #                        export TACKLE_PROMPT="/pr-review"
+#   TACKLE_DEPS         — set to "off" to skip all dependency handling (default: on).
+#                      Same as passing --no-deps on every run.
+#   TACKLE_PNPM_SYMLINK — set to "true" to allow symlink-reuse of a pnpm node_modules
+#                      (only safe for flat/hoisted pnpm layouts; default: install).
 #   TACKLE_REPO_CHECK   — cross-repo guard for PR *URLs* (default: local).
 #                      A PR URL carries its own owner/repo; if it names a
 #                      different GitHub repo than the current checkout, tackle would
@@ -99,6 +113,8 @@ _tackle_impl() {
   local new_mode=false     # --new: create the branch instead of resolving an existing one
   local base_ref=""        # --base: ref to branch from in --new mode (default HEAD)
   local force_install=false
+  local no_deps=false
+  [[ "${TACKLE_DEPS:-on}" == "off" ]] && no_deps=true
   local show_time=false
   # Copy unversioned .env files into the worktree by default; TACKLE_COPY_ENV=false
   # (env) or --no-env (per-run) disables it.
@@ -128,6 +144,113 @@ _tackle_impl() {
   _tackle_err() {  # red   — error (stderr)
     if [ -t 2 ]; then printf '%s\033[31mtackle:\033[0m ✗ %s\n' "$(_tackle_ts)" "$*" >&2
     else printf '%stackle: ✗ %s\n' "$(_tackle_ts)" "$*" >&2; fi
+  }
+
+  # ── dependency setup (registry-driven, language-agnostic) ───────────────────
+  # Nested like the log helpers above so these close over $force_install /
+  # $no_deps / the log helpers with no parameter plumbing. Called once, from the
+  # worktree root, with the main worktree path as $1.
+  #
+  # The reliable, cross-language signal for "did deps change on this branch" is the
+  # LOCKFILE (the resolved dependency graph) — never a comparison of the installed
+  # tree. We symlink the main repo's install dir only when it's provably safe AND
+  # free (flat tree + identical lockfile); otherwise we defer to the ecosystem's
+  # own installer, which is fast off its warm global cache.
+
+  # True when the pnpm layout is flat/hoisted, so a single root-symlink is safe.
+  # Default (strict/nested pnpm) is install — see the header comment.
+  _tackle_pnpm_is_hoisted() {
+    [[ "${TACKLE_PNPM_SYMLINK:-}" == "true" ]] && return 0
+    grep -qs 'node-linker[[:space:]]*=[[:space:]]*hoisted' .npmrc 2>/dev/null && return 0
+    grep -qs 'nodeLinker:[[:space:]]*hoisted' pnpm-workspace.yaml 2>/dev/null && return 0
+    return 1
+  }
+
+  # Decide whether symlink-reuse is valid for one ecosystem. All must hold:
+  #   main, root_symlinkable(yes/no), reuse_dir, lockfiles(comma-separated)
+  _tackle_can_symlink_reuse() {
+    local main="$1" sym="$2" dir="$3" lfs="$4" lf
+    $force_install                && return 1   # --install forces isolation
+    [[ "$sym" == yes ]]           || return 1   # ecosystem must be root-symlinkable
+    [[ -n "$dir" ]]               || return 1
+    [[ ! -e "./$dir" ]]           || return 1   # never clobber a checked-out tree
+    # reuse dir must exist AND be non-empty in main (an empty node_modules — the
+    # Bazel/infrastructure case — is worthless to symlink; -d alone isn't enough).
+    [[ -d "$main/$dir" && -n "$(ls -A "$main/$dir" 2>/dev/null)" ]] || return 1
+    # every comparison lockfile must exist both sides and be byte-identical.
+    while IFS= read -r lf; do
+      [[ -z "$lf" ]] && continue
+      [[ -f "$main/$lf" && -f "./$lf" ]] || return 1
+      cmp -s "$main/$lf" "./$lf"         || return 1
+    done <<< "${lfs//,/$'\n'}"
+    return 0
+  }
+
+  # Symlink the main repo's install dir into the worktree and git-exclude it.
+  # .gitignore patterns like `node_modules/` (trailing slash) match real dirs but
+  # not symlinks, so we add the name to the common gitdir's info/exclude.
+  _tackle_symlink_reuse() {
+    local main="$1" dir="$2" common_gitdir
+    ln -s "$main/$dir" "./$dir"
+    common_gitdir=$(git rev-parse --git-common-dir)
+    mkdir -p "$common_gitdir/info"
+    grep -qxF "$dir" "$common_gitdir/info/exclude" 2>/dev/null \
+      || echo "$dir" >> "$common_gitdir/info/exclude"
+    _tackle_ok "$dir symlinked from main repo (lockfiles match)"
+    _tackle_warn "dep changes here (e.g. adding packages) will affect the main repo — use --install to isolate"
+  }
+
+  _tackle_setup_deps() {              # $1 = main worktree path; cwd = new worktree
+    local main_repo="$1"
+
+    # Bazel owns out-of-tree caches (~/Library/Caches/bazel); the in-tree
+    # node_modules/.venv/target are empty by design, so reuse/install here is
+    # pointless or wrong. Short-circuit before touching the registry.
+    if [[ -f MODULE.bazel || -f WORKSPACE || -f WORKSPACE.bazel ]]; then
+      _tackle_log "Bazel workspace detected — skipping in-tree dependency reuse (Bazel manages caches out of tree)"
+      return 0
+    fi
+
+    if $no_deps; then
+      _tackle_log "dependency handling disabled (--no-deps / TACKLE_DEPS=off)"
+      return 0
+    fi
+
+    # Registry: one '|'-delimited row per package-manager ecosystem. Fields:
+    #   name | family | marker | lockfiles(comma) | reuse_dir | root_symlinkable | install_cmd
+    # Rows scan top-to-bottom; the first match within a `family` wins (pnpm>yarn>npm
+    # — they share node_modules), while different families are all handled so
+    # multilingual repos install every ecosystem present. Add a manager = add a row.
+    local _rows=(
+      'pnpm|js|pnpm-lock.yaml|pnpm-lock.yaml|node_modules|no|pnpm i'
+      'yarn|js|yarn.lock|yarn.lock|node_modules|yes|yarn'
+      'npm|js|package-lock.json|package-lock.json|node_modules|yes|npm i'
+      'npm|js|package.json|package.json|node_modules|yes|npm i'
+      'cargo|rust|Cargo.lock|Cargo.lock|target|no|cargo fetch'
+      'go|go|go.sum|go.sum||no|go mod download'
+      'poetry|python|poetry.lock|poetry.lock|.venv|no|poetry install'
+      'uv|python|uv.lock|uv.lock|.venv|no|uv sync'
+      'pip|python|requirements.txt|requirements.txt|.venv|no|pip install -r requirements.txt'
+    )
+
+    local _handled=" " _row name family marker lockfiles reuse_dir symlinkable install_cmd
+    for _row in "${_rows[@]}"; do
+      IFS='|' read -r name family marker lockfiles reuse_dir symlinkable install_cmd <<< "$_row"
+      [[ -f "$marker" ]] || continue                        # not this ecosystem
+      case "$_handled" in *" $family "*) continue ;; esac    # family already handled
+      _handled="$_handled$family "
+
+      # A flat/hoisted pnpm layout is safe to root-symlink; strict pnpm is not.
+      [[ "$name" == pnpm ]] && _tackle_pnpm_is_hoisted && symlinkable=yes
+
+      if _tackle_can_symlink_reuse "$main_repo" "$symlinkable" "$reuse_dir" "$lockfiles"; then
+        _tackle_symlink_reuse "$main_repo" "$reuse_dir"
+      else
+        _tackle_log "installing $name dependencies ($install_cmd) ..."
+        eval "$install_cmd" || return 1
+      fi
+    done
+    return 0
   }
 
   # Optional env file for centralised config. Resolution order:
@@ -164,6 +287,7 @@ _tackle_impl() {
       --base=*)                  base_ref="${1#--base=}"; shift ;;
       --done|--close|--exit)     done_mode=true;      shift ;;
       --install)                 force_install=true;  shift ;;
+      --no-deps)                 no_deps=true;        shift ;;
       --no-env)                  copy_env=false;      shift ;;
       --time)                    show_time=true;      shift ;;
       --repo-check)
@@ -540,36 +664,7 @@ print(t, end='')
 
   cd "$worktree_path" || return 1
 
-  local install_cmd="" lockfile=""
-  if [[ -f "pnpm-lock.yaml" ]];      then install_cmd="pnpm i";  lockfile="pnpm-lock.yaml"
-  elif [[ -f "yarn.lock" ]];         then install_cmd="yarn";     lockfile="yarn.lock"
-  elif [[ -f "package-lock.json" ]]; then install_cmd="npm i";    lockfile="package-lock.json"
-  elif [[ -f "package.json" ]];      then install_cmd="npm i"
-  fi
-
-  if [[ -n "$install_cmd" ]]; then
-    if ! $force_install \
-      && [[ -n "$lockfile" ]] \
-      && [[ -d "$main_repo/node_modules" ]]; then
-      ln -s "$main_repo/node_modules" ./node_modules
-      # .gitignore typically has node_modules/ (trailing slash) which matches
-      # real dirs but not symlinks. Write to the common gitdir's info/exclude
-      # so git doesn't show the symlink as untracked.
-      local common_gitdir
-      common_gitdir=$(git rev-parse --git-common-dir)
-      mkdir -p "$common_gitdir/info"
-      grep -qxF "node_modules" "$common_gitdir/info/exclude" 2>/dev/null \
-        || echo "node_modules" >> "$common_gitdir/info/exclude"
-      _tackle_ok "node_modules symlinked from main repo"
-      _tackle_warn "dep changes here (e.g. pnpm add) will affect the main repo — use --install to isolate"
-      if ! diff -q "$main_repo/$lockfile" "./$lockfile" &>/dev/null; then
-        _tackle_warn "lockfiles differ — some deps may be missing; run 'pnpm i' or re-run with --install if builds fail"
-      fi
-    else
-      _tackle_log "installing dependencies ($install_cmd) ..."
-      eval "$install_cmd" || return 1
-    fi
-  fi
+  _tackle_setup_deps "$main_repo" || return 1
 
   # Copy unversioned .env files from the main repo into the worktree.
   # git worktree add only materialises *tracked* files, so any gitignored .env

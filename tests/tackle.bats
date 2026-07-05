@@ -143,16 +143,24 @@ setup() {
   [ ! -f "$BATS_TEST_TMPDIR/repo_feature/.env" ]
 }
 
-# ── dependency handling (node_modules symlink) ───────────────────────────────
-
-@test "symlinks node_modules from the main repo and git-excludes it" {
+# ── dependency handling (registry: symlink-vs-install decision) ───────────────
+#
+# Helper: seed the main repo with a JS package + lockfile on a fresh `feature`
+# branch, plus a non-empty node_modules in main. $1 = lockfile name (default
+# package-lock.json), $2 = its contents (default lock-v1).
+_seed_js_repo() {
+  local lockname="${1:-package-lock.json}" lockbody="${2:-lock-v1}"
   git -C "$REPO" branch -D feature
   printf '{}\n' > "$REPO/package.json"
-  printf 'lock-v1\n' > "$REPO/package-lock.json"
+  printf '%s\n' "$lockbody" > "$REPO/$lockname"
   git -C "$REPO" add -A
   git -C "$REPO" commit -q -m deps
   git -C "$REPO" branch feature
-  mkdir -p "$REPO/node_modules/foo"          # untracked deps dir in main
+  mkdir -p "$REPO/node_modules/foo"          # untracked, non-empty deps dir in main
+}
+
+@test "npm: identical lockfile → symlinks node_modules and git-excludes it" {
+  _seed_js_repo
   cd "$REPO"
   run tackle feature --no-agent
   [ "$status" -eq 0 ]
@@ -162,19 +170,205 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
-@test "warns when the worktree lockfile differs from the main repo" {
+@test "npm: differing lockfile → installs instead of symlinking a stale tree" {
+  write_install_stub npm
+  _seed_js_repo
+  # branch keeps lock-v1 (committed); main drifts to a different lockfile.
+  printf 'lock-v2-CHANGED\n' > "$REPO/package-lock.json"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ ! -L "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]        # not a symlink
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [[ "$output" == *"npm"* ]]                                    # install ran
+  [[ "$output" != *"lockfiles differ"* ]]                       # old warned-symlink path gone
+}
+
+@test "npm: --install forces install even when the lockfile is identical" {
+  write_install_stub npm
+  _seed_js_repo
+  cd "$REPO"
+  run tackle feature --no-agent --install
+  [ "$status" -eq 0 ]
+  [ ! -L "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [[ "$output" == *"npm"* ]]
+}
+
+@test "pnpm: defaults to install even when the lockfile is identical (strict/nested)" {
+  write_install_stub pnpm
+  _seed_js_repo pnpm-lock.yaml lock-v1
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ ! -L "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [[ "$output" == *"pnpm"* ]]
+}
+
+@test "pnpm: hoisted opt-in (TACKLE_PNPM_SYMLINK) symlinks instead of installing" {
+  write_install_stub pnpm
+  _seed_js_repo pnpm-lock.yaml lock-v1
+  cd "$REPO"
+  TACKLE_PNPM_SYMLINK=true run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ -L "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed" ]   # pnpm never ran
+}
+
+@test "pnpm: node-linker=hoisted in .npmrc enables symlink reuse" {
+  write_install_stub pnpm
+  git -C "$REPO" branch -D feature
+  printf '{}\n' > "$REPO/package.json"
+  printf 'lock-v1\n' > "$REPO/pnpm-lock.yaml"
+  printf 'node-linker=hoisted\n' > "$REPO/.npmrc"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  mkdir -p "$REPO/node_modules/foo"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ -L "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed" ]
+}
+
+@test "JS family is exclusive: pnpm wins over package.json, npm does not also run" {
+  write_install_stub pnpm
+  write_install_stub npm
+  git -C "$REPO" branch -D feature
+  printf '{}\n' > "$REPO/package.json"
+  printf 'lock-v1\n' > "$REPO/pnpm-lock.yaml"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  # Exactly one JS ecosystem installed, and it is pnpm (note: "pnpm" contains the
+  # substring "npm", so assert the whole recorded line, not a substring).
+  [ "$(grep -c . "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed")" -eq 1 ]
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [ "$output" = "pnpm" ]
+}
+
+@test "multilingual repo installs every ecosystem present (pnpm + cargo + go)" {
+  write_install_stub pnpm
+  write_install_stub cargo target
+  write_install_stub go .go-noop
+  git -C "$REPO" branch -D feature
+  printf '{}\n'        > "$REPO/package.json"
+  printf 'lock-v1\n'   > "$REPO/pnpm-lock.yaml"
+  printf 'cargo-v1\n'  > "$REPO/Cargo.lock"
+  printf 'go-v1\n'     > "$REPO/go.sum"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [[ "$output" == *"pnpm"* ]]
+  [[ "$output" == *"cargo"* ]]
+  [[ "$output" == *"go"* ]]
+}
+
+@test "empty node_modules in main → installs, never symlinks an empty tree" {
+  write_install_stub npm
   git -C "$REPO" branch -D feature
   printf '{}\n' > "$REPO/package.json"
   printf 'lock-v1\n' > "$REPO/package-lock.json"
   git -C "$REPO" add -A
   git -C "$REPO" commit -q -m deps
   git -C "$REPO" branch feature
-  mkdir -p "$REPO/node_modules"
-  printf 'lock-v2-CHANGED\n' > "$REPO/package-lock.json"     # main drifts
+  mkdir -p "$REPO/node_modules"               # present but EMPTY (the Bazel case)
   cd "$REPO"
   run tackle feature --no-agent
   [ "$status" -eq 0 ]
-  [[ "$output" == *"lockfiles differ"* ]]
+  [ ! -L "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [[ "$output" == *"npm"* ]]
+}
+
+@test "python: requirements.txt installs, never symlinks a .venv" {
+  write_install_stub pip .venv
+  git -C "$REPO" branch -D feature
+  printf 'requests==2.0\n' > "$REPO/requirements.txt"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  mkdir -p "$REPO/.venv/lib"                   # non-empty venv in main
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ ! -L "$BATS_TEST_TMPDIR/repo_feature/.venv" ]   # venvs are never relocatable
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [[ "$output" == *"pip"* ]]
+}
+
+@test "Bazel workspace short-circuits: no symlink, no install" {
+  write_install_stub npm
+  git -C "$REPO" branch -D feature
+  printf '{}\n' > "$REPO/package.json"
+  printf 'lock-v1\n' > "$REPO/package-lock.json"
+  printf 'module(name="x")\n' > "$REPO/MODULE.bazel"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  mkdir -p "$REPO/node_modules/foo"            # non-empty, but Bazel owns deps
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]     # no symlink created
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed" ]  # no install ran
+  [[ "$output" == *"Bazel workspace detected"* ]]
+}
+
+@test "Bazel WORKSPACE variant also short-circuits" {
+  git -C "$REPO" branch -D feature
+  printf '{}\n' > "$REPO/package.json"
+  printf 'lock-v1\n' > "$REPO/package-lock.json"
+  printf 'workspace(name="x")\n' > "$REPO/WORKSPACE"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  mkdir -p "$REPO/node_modules/foo"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  [[ "$output" == *"Bazel workspace detected"* ]]
+}
+
+@test "--no-deps skips all dependency handling" {
+  write_install_stub npm
+  _seed_js_repo
+  cd "$REPO"
+  run tackle feature --no-agent --no-deps
+  [ "$status" -eq 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed" ]
+  [[ "$output" == *"dependency handling disabled"* ]]
+}
+
+@test "TACKLE_DEPS=off skips all dependency handling" {
+  write_install_stub npm
+  _seed_js_repo
+  cd "$REPO"
+  TACKLE_DEPS=off run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed" ]
+}
+
+@test "yarn: identical lockfile symlinks and writes the reuse dir to info/exclude" {
+  _seed_js_repo yarn.lock lock-v1
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ -L "$BATS_TEST_TMPDIR/repo_feature/node_modules" ]
+  run grep -qxF node_modules "$REPO/.git/info/exclude"
+  [ "$status" -eq 0 ]
 }
 
 # ── teardown (--done) ────────────────────────────────────────────────────────

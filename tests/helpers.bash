@@ -68,6 +68,22 @@ init_repo() {
   printf '%s' "$dir"
 }
 
+# Package-manager stub: shadows a real installer (npm/pnpm/yarn/cargo/go/poetry/uv/pip)
+# so dependency tests assert install-vs-symlink hermetically, with no network and no
+# real toolchain. When invoked it (a) appends its own name to ./.tackle-installed in
+# the cwd, and (b) fakes materialisation by creating its reuse dir ($2, default
+# node_modules) so downstream steps see a populated tree. Always exits 0.
+write_install_stub() {
+  local name="$1" reuse_dir="${2:-node_modules}"
+  cat > "$BATS_TEST_TMPDIR/bin/$name" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "$name" >> ./.tackle-installed
+mkdir -p "./$reuse_dir/.installed-by-$name"
+exit 0
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/$name"
+}
+
 # fzf stub for the multi-PR picker: emits the stdin line matching $FZF_STUB_PICK
 # (a substring), or nothing + exit 1 when FZF_STUB_PICK is unset (simulating a
 # cancelled picker).
