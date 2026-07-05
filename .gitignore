@@ -1,0 +1,2 @@
+# Local secrets / personal config — tackle auto-loads a .env beside the script.
+.env
