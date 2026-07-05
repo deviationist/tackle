@@ -249,3 +249,7 @@ resolution and the `remote` cross-repo check; `fzf` unlocks the multi-PR picker.
 
 See `tests/README.md` for the suite layout and how the hermetic `gh`/agent stubs
 work.
+
+## License
+
+[MIT](LICENSE) © Robert S.
