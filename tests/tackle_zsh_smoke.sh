@@ -16,7 +16,8 @@ trap 'rm -rf "$TMP"' EXIT
 export TACKLE_ENV_FILE="$TMP/no.env"
 export TACKLE_AGENT=true
 export TACKLE_DIR_TEMPLATE='{repo}_{branch}'
-unset TACKLE_PROMPT TACKLE_COPY_ENV 2>/dev/null || true
+export TACKLE_STATE_DIR="$TMP/state"     # isolate the project-config trust store
+unset TACKLE_PROMPT TACKLE_COPY_ENV TACKLE_DEPS TACKLE_CONFIG 2>/dev/null || true
 
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'EOF'
@@ -67,4 +68,28 @@ tackle feature --no-agent
 [[ -d "$TMP/deprepo_feature/node_modules/foo" ]] \
   || { print -r -- "FAIL: symlinked node_modules does not resolve to main's"; exit 1 }
 
-print -r -- "zsh smoke: OK (create + --done + dep-registry under zsh $ZSH_VERSION)"
+# ── project config under real zsh ────────────────────────────────────────────
+# The config path leans on process substitution (`< <(_tackle_cfg_list ...)`),
+# dynamic-scope assignment of $_cfg_run_hooks from a nested helper, and a python
+# heredoc — all worth exercising under zsh, not just bash. Use --trust so the
+# setup hook actually runs (no interactive prompt).
+git init -q "$TMP/cfgrepo"
+git -C "$TMP/cfgrepo" config user.email test@example.com
+git -C "$TMP/cfgrepo" config user.name  tester
+printf 'seed\n' > "$TMP/cfgrepo/seed.txt"
+git -C "$TMP/cfgrepo" add -A
+git -C "$TMP/cfgrepo" commit -q -m init
+cat > "$TMP/cfgrepo/tackle.toml" <<'TOML'
+copy = ["seed.txt"]
+[hooks]
+setup = ["echo ran > hook_ran.txt"]
+TOML
+
+cd "$TMP/cfgrepo"
+tackle --new cfgbranch --no-agent --trust
+[[ -f "$TMP/cfgrepo_cfgbranch/seed.txt" ]] \
+  || { print -r -- "FAIL: config copy did not materialize under zsh"; exit 1 }
+[[ -f "$TMP/cfgrepo_cfgbranch/hook_ran.txt" ]] \
+  || { print -r -- "FAIL: config setup hook did not run under zsh"; exit 1 }
+
+print -r -- "zsh smoke: OK (create + --done + dep-registry + project-config under zsh $ZSH_VERSION)"
