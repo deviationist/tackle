@@ -14,6 +14,8 @@
 #   tackle <branch> --install            # force isolated install even if lockfile unchanged
 #   tackle <branch> --no-deps            # skip all dependency handling (no symlink, no install)
 #   tackle <branch> --no-env             # skip copying unversioned .env files into the worktree
+#   tackle <branch> --no-config          # ignore any project tackle.toml for this run
+#   tackle <branch> --trust              # pre-approve the project config's hook commands
 #   tackle <branch> --time               # prefix each step with a [HH:MM:SS] timestamp
 #   tackle <PR-url> --repo-check remote  # verify the URL's repo vs this checkout via gh (see below)
 #   tackle <branch> --review             # launch agent with built-in "what changed?" prompt
@@ -75,6 +77,23 @@
 #   Override the path with TACKLE_ENV_FILE=/path/to/your.env in your shell rc.
 #   Caller-set env vars always win over the env file (one-shot overrides work).
 #
+# Project config (optional — travels with the repo; how to bring a worktree up):
+#   A tackle.toml (or tackle.json) at the repo root — or a monorepo subdir; tackle
+#   walks cwd up to the repo root to find it — declares per-project defaults and
+#   setup steps. A gitignored tackle.local.toml deep-merges on top (local keys
+#   replace base keys). Recognized keys:
+#     agent / dir_template / prompt / deps   — per-project TACKLE_* defaults
+#     copy    = ["path", ...]                — copy    main repo → worktree
+#     symlink = ["path", ...]                — symlink main repo → worktree (git-excluded)
+#     [hooks] pre_create / setup / on_done   — commands run before create / after
+#                                               create (in the worktree) / on --done
+#   Hooks get $TACKLE_MAIN, $TACKLE_WORKTREE, $TACKLE_BRANCH in their env.
+#   Precedence: CLI flag > caller env > tackle.local > tackle (base) > .env > default.
+#   Because a committed config runs commands, hook execution is gated by a
+#   trust-on-first-use prompt (per repo; re-prompts if the config later changes).
+#   Skip it with --no-config / TACKLE_CONFIG=off; pre-approve with --trust.
+#   See tackle.example.toml for a fully commented template.
+#
 # Prompt template variables (usable in --prompt, --review, TACKLE_PROMPT):
 #   {branch}            — resolved branch name
 #   {pr_number}         — PR number (only when input is a PR number or URL)
@@ -113,8 +132,9 @@ _tackle_impl() {
   local new_mode=false     # --new: create the branch instead of resolving an existing one
   local base_ref=""        # --base: ref to branch from in --new mode (default HEAD)
   local force_install=false
-  local no_deps=false
-  [[ "${TACKLE_DEPS:-on}" == "off" ]] && no_deps=true
+  local no_deps=false      # --no-deps forces true; TACKLE_DEPS / config resolved later
+  local no_config=false    # --no-config: ignore any project tackle.toml this run
+  local force_trust=false  # --trust: pre-approve the project config's hooks
   local show_time=false
   # Copy unversioned .env files into the worktree by default; TACKLE_COPY_ENV=false
   # (env) or --no-env (per-run) disables it.
@@ -122,9 +142,12 @@ _tackle_impl() {
   [[ "${TACKLE_COPY_ENV:-true}" == "true" ]] || copy_env=false
   local repo_check_flag=""  # --repo-check: local|remote|off (overrides TACKLE_REPO_CHECK)
   local prompt=""
+  local prompt_cli_set=false  # true once --prompt/--review sets the base prompt
   local prompt_extra=""   # --add   : placed at {additive_prompt} or appended
   local prompt_before=""  # --before: always prepended
   local prompt_after=""   # --after : always appended
+  # Project-config state, populated after arg-parse + git verification.
+  local _cfg_json="" _cfg_dir="" _cfg_run_hooks=false
 
   # Logging helpers — colors only when the fd is a TTY.
   _tackle_ts() { $show_time && printf '[%s] ' "$(date '+%H:%M:%S')"; }
@@ -253,27 +276,265 @@ _tackle_impl() {
     return 0
   }
 
-  # Optional env file for centralised config. Resolution order:
-  #   1. TACKLE_ENV_FILE env var (explicit override)
-  #   2. .env in the same directory as tackle.zsh (auto-detected at source time)
-  # Caller's shell env still wins — values set before calling tackle are captured
-  # first so a one-shot TACKLE_AGENT=cursor tackle ... overrides the env file.
+  # ── project config (tackle.toml / tackle.local.toml) ────────────────────────
+  # A per-project file, committed at the repo root (or a monorepo subdir), that
+  # declares how to bring a worktree up to "running": TACKLE_* defaults, extra
+  # files to copy/symlink, and setup/teardown hook commands. A gitignored
+  # tackle.local.{toml,json} deep-merges on top (local keys replace base keys).
+  # All parsing/merging/validation lives in one python helper (python3 is already
+  # a hard dep); the shell just consumes the normalized JSON it prints.
+  _tackle_cfg_run() { python3 - "$@" <<'PY'
+import sys, os, json
+
+def _load_file(path):
+    if path.endswith('.toml'):
+        try:
+            import tomllib as T
+        except ModuleNotFoundError:
+            try:
+                import tomli as T
+            except ModuleNotFoundError:
+                sys.stderr.write("tackle: %s needs a TOML parser (Python 3.11+ tomllib or 'pip install tomli') — or use a tackle.json instead\n" % os.path.basename(path))
+                sys.exit(3)
+        with open(path, 'rb') as f:
+            return T.load(f)
+    with open(path) as f:
+        return json.load(f)
+
+def _deep_merge(b, o):
+    if isinstance(b, dict) and isinstance(o, dict):
+        r = dict(b)
+        for k, v in o.items():
+            r[k] = _deep_merge(b[k], v) if k in b else v
+        return r
+    return o
+
+def _as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    return [str(v)]
+
+_NAMES_BASE  = ('tackle.toml', 'tackle.json')
+_NAMES_LOCAL = ('tackle.local.toml', 'tackle.local.json')
+
+def _first_existing(cfgdir, names):
+    for n in names:
+        p = os.path.join(cfgdir, n)
+        if os.path.isfile(p):
+            return n, p
+    return None, None
+
+def _normalize(cfgdir):
+    files = []
+    bn, bp = _first_existing(cfgdir, _NAMES_BASE)
+    base = {}
+    if bp:
+        base = _load_file(bp); files.append(bn)
+    ln, lp = _first_existing(cfgdir, _NAMES_LOCAL)
+    local = {}
+    if lp:
+        local = _load_file(lp); files.append(ln)
+    merged = _deep_merge(base, local) if local else base
+    if not isinstance(merged, dict):
+        sys.stderr.write("tackle: config root must be a table/object\n"); sys.exit(4)
+    hooks = merged.get('hooks') or {}
+    if not isinstance(hooks, dict):
+        sys.stderr.write("tackle: config [hooks] must be a table\n"); sys.exit(4)
+    out = {
+        'agent':        merged.get('agent'),
+        'dir_template': merged.get('dir_template'),
+        'prompt':       merged.get('prompt'),
+        'deps':         merged.get('deps'),
+        'copy':         _as_list(merged.get('copy')),
+        'symlink':      _as_list(merged.get('symlink')),
+        'hooks':        {k: _as_list(hooks.get(k)) for k in ('pre_create', 'setup', 'on_done')},
+        'files':        files,
+    }
+    for key in ('copy', 'symlink'):
+        for p in out[key]:
+            if p.startswith('/') or p == '..' or p.startswith('../') or '/../' in p or p.endswith('/..'):
+                sys.stderr.write("tackle: unsafe %s path %r in config (no absolute or parent-dir paths)\n" % (key, p)); sys.exit(4)
+    if out['deps'] not in (None, 'on', 'off'):
+        sys.stderr.write("tackle: config 'deps' must be \"on\" or \"off\"\n"); sys.exit(4)
+    for s in ('agent', 'dir_template', 'prompt'):
+        if out[s] is not None and not isinstance(out[s], str):
+            sys.stderr.write("tackle: config '%s' must be a string\n" % s); sys.exit(4)
+    return out
+
+def _dig(d, key):
+    for part in key.split('.'):
+        d = d.get(part) if isinstance(d, dict) else None
+    return d
+
+mode = sys.argv[1]
+if mode == 'discover':
+    start = os.path.abspath(sys.argv[2])
+    ceiling = os.path.abspath(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+    d = start
+    while True:
+        for n in _NAMES_BASE + _NAMES_LOCAL:
+            if os.path.isfile(os.path.join(d, n)):
+                print(d); sys.exit(0)
+        if ceiling and d == ceiling:
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    sys.exit(0)
+elif mode == 'load':
+    print(json.dumps(_normalize(sys.argv[2]), sort_keys=True))
+elif mode == 'scalar':
+    v = _dig(json.loads(sys.argv[2]), sys.argv[3])
+    print('' if v is None else v)
+elif mode == 'list':
+    for x in (_dig(json.loads(sys.argv[2]), sys.argv[3]) or []):
+        print(x)
+elif mode == 'fingerprint':
+    import hashlib
+    print(hashlib.sha256(sys.argv[2].encode()).hexdigest())
+elif mode == 'diff':
+    import difflib
+    a = json.dumps(json.loads(sys.argv[2]), indent=2, sort_keys=True).splitlines()
+    b = json.dumps(json.loads(sys.argv[3]), indent=2, sort_keys=True).splitlines()
+    for line in difflib.unified_diff(a, b, fromfile='last-trusted', tofile='current', lineterm=''):
+        print(line)
+else:
+    sys.stderr.write("tackle: internal: unknown config mode %r\n" % mode); sys.exit(2)
+PY
+  }
+
+  _tackle_cfg_scalar() { _tackle_cfg_run scalar "$_cfg_json" "$1"; }
+  _tackle_cfg_list()   { _tackle_cfg_run list   "$_cfg_json" "$1"; }
+
+  # True when the merged config declares any hook command.
+  _tackle_cfg_has_hooks() {
+    local n
+    n=$( { _tackle_cfg_list hooks.pre_create
+           _tackle_cfg_list hooks.setup
+           _tackle_cfg_list hooks.on_done; } | grep -c . )
+    [[ "$n" -gt 0 ]]
+  }
+
+  # Pretty-print the hook commands for the first-trust prompt.
+  _tackle_cfg_show_hooks() {
+    local ph cmd first
+    for ph in pre_create setup on_done; do
+      first=true
+      while IFS= read -r cmd; do
+        [[ -z "$cmd" ]] && continue
+        $first && { printf '    [%s]\n' "$ph"; first=false; }
+        printf '      %s\n' "$cmd"
+      done < <(_tackle_cfg_list "hooks.$ph")
+    done
+  }
+
+  # Trust gate for command execution (TOFU with change detection, à la ssh known
+  # hosts / direnv allow). Sets $_cfg_run_hooks in the caller's scope. The stored
+  # baseline is the full normalized merged config, so a change in EITHER the base
+  # or the local file re-triggers the prompt. Config-only keys always apply — only
+  # command execution is gated here.
+  _tackle_cfg_trust() {
+    _cfg_run_hooks=false
+    local statedir="${TACKLE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tackle}/trust"
+    local key tf stored
+    key=$(_tackle_cfg_run fingerprint "$_cfg_dir")
+    tf="$statedir/$key"
+
+    if $force_trust; then
+      mkdir -p "$statedir" && printf '%s' "$_cfg_json" > "$tf"
+      _cfg_run_hooks=true; return 0
+    fi
+
+    stored=""
+    [[ -f "$tf" ]] && stored=$(cat "$tf")
+    if [[ -n "$stored" && "$stored" == "$_cfg_json" ]]; then
+      _cfg_run_hooks=true; return 0                    # already trusted, unchanged
+    fi
+
+    # Distinguish first-trust (neutral) from a changed-since-trusted config
+    # (cautionary + a diff of what changed — this is what catches a command
+    # slipped in via a git pull or the tackle.local layer).
+    if [[ -z "$stored" ]]; then
+      _tackle_warn "this project defines tackle setup commands — first time here. Review before trusting:"
+      _tackle_cfg_show_hooks >&2
+    else
+      _tackle_warn "this project's tackle config CHANGED since you trusted it. What changed:"
+      _tackle_cfg_run diff "$stored" "$_cfg_json" | sed 's/^/    /' >&2
+    fi
+    # read unconditionally: interactively this prompts; non-interactively (CI,
+    # closed stdin) read hits EOF, ans stays empty, and we fall through to skip —
+    # so hooks never auto-run and tackle never hangs. Pre-approve with --trust.
+    printf 'tackle: trust these commands for %s? [o]nce / [a]lways / [s]kip (default: skip) ' "$_cfg_dir" >&2
+    local ans=""; read -r ans || true
+    case "$ans" in
+      o|O|once)   _cfg_run_hooks=true ;;
+      a|A|always) _cfg_run_hooks=true
+                  mkdir -p "$statedir" && printf '%s' "$_cfg_json" > "$tf"
+                  _tackle_ok "trusted — remembered for next time" ;;
+      *)          _tackle_warn "skipped hooks (config-only settings still apply — approve with --trust)" ;;
+    esac
+    return 0
+  }
+
+  # Run one hook phase. Each command is eval'd in a subshell cd'd to $2 with
+  # $TACKLE_MAIN / $TACKLE_WORKTREE / $TACKLE_BRANCH exported. pre_create failure
+  # is fatal (abort before creating the worktree); setup/on_done failures warn and
+  # continue (the worktree exists; better to let the user fix it than tear down).
+  _tackle_run_hooks() {              # $1=phase  $2=rundir  $3=worktree-or-empty
+    local phase="$1" rundir="$2" wt="$3" cmd
+    while IFS= read -r cmd; do
+      [[ -z "$cmd" ]] && continue
+      _tackle_log "hook[$phase] $cmd"
+      ( cd "$rundir" && TACKLE_MAIN="$main_repo" TACKLE_WORKTREE="$wt" TACKLE_BRANCH="$branch" eval "$cmd" )
+      if [[ $? -ne 0 ]]; then
+        if [[ "$phase" == pre_create ]]; then
+          _tackle_err "pre_create hook failed: $cmd"; return 1
+        fi
+        _tackle_warn "hook[$phase] failed (continuing): $cmd"
+      fi
+    done < <(_tackle_cfg_list "hooks.$phase")
+    return 0
+  }
+
+  # Copy / symlink the config-declared paths from the main repo into the worktree.
+  # Runs with cwd = worktree root. copy overwrites (explicit intent); symlink skips
+  # a destination that already exists. Paths are validated (no absolute / no ..) by
+  # the python loader, so they can only land inside the worktree.
+  _tackle_cfg_materialize() {        # $1 = main repo path; cwd = worktree
+    local main="$1" p src n=0
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      src="$main/$p"
+      if [[ ! -e "$src" ]]; then _tackle_warn "config copy: '$p' not found in main repo — skipping"; continue; fi
+      mkdir -p "$(dirname "$p")"
+      if cp -Rp "$src" "$p" 2>/dev/null; then _tackle_log "copied $p from main repo"; n=$((n + 1)); fi
+    done < <(_tackle_cfg_list copy)
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      src="$main/$p"
+      if [[ ! -e "$src" ]]; then _tackle_warn "config symlink: '$p' not found in main repo — skipping"; continue; fi
+      [[ -e "./$p" ]] && continue
+      mkdir -p "$(dirname "$p")"
+      if ln -s "$src" "./$p"; then _tackle_log "symlinked $p → main repo"; n=$((n + 1)); fi
+    done < <(_tackle_cfg_list symlink)
+    [[ "$n" -gt 0 ]] && _tackle_ok "materialized $n path(s) declared in config"
+    return 0
+  }
+
+  # Capture caller-set env NOW, before the .env file or the project config can
+  # touch it — a one-shot `TACKLE_AGENT=cursor tackle ...` must win over both.
+  # The full precedence (caller env > project config > .env file > default) is
+  # resolved after arg-parse + git verification, because it depends on
+  # --no-config and on discovering the repo root. See "resolve effective config".
   local _env_agent="$TACKLE_AGENT"
   local _env_template="$TACKLE_DIR_TEMPLATE"
   local _env_prompt="$TACKLE_PROMPT"
-  local _env_file="${TACKLE_ENV_FILE:-${_TACKLE_SCRIPT_DIR:+${_TACKLE_SCRIPT_DIR}/.env}}"
-  if [[ -n "${_env_file:-}" && -f "$_env_file" ]]; then
-    # shellcheck source=/dev/null
-    source "$_env_file"
-  fi
-  [[ -n "$_env_agent" ]]    && TACKLE_AGENT="$_env_agent"
-  [[ -n "$_env_template" ]] && TACKLE_DIR_TEMPLATE="$_env_template"
-  [[ -n "$_env_prompt" ]]   && TACKLE_PROMPT="$_env_prompt"
-
-  local agent="${TACKLE_AGENT:-claude}"
-  local template="${TACKLE_DIR_TEMPLATE:-}"
-  [[ -z "$template" ]] && template='{repo}_{branch}'
-  prompt="${TACKLE_PROMPT:-}"
+  local _env_deps="$TACKLE_DEPS"
+  local _env_deps_set=false; [[ -n "${TACKLE_DEPS+x}" ]] && _env_deps_set=true
+  local agent template
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -288,6 +549,8 @@ _tackle_impl() {
       --done|--close|--exit)     done_mode=true;      shift ;;
       --install)                 force_install=true;  shift ;;
       --no-deps)                 no_deps=true;        shift ;;
+      --no-config)               no_config=true;      shift ;;
+      --trust)                   force_trust=true;    shift ;;
       --no-env)                  copy_env=false;      shift ;;
       --time)                    show_time=true;      shift ;;
       --repo-check)
@@ -300,13 +563,13 @@ _tackle_impl() {
         prompt="Please summarize what has changed in this branch compared to the base branch. What is the goal of these changes, and are there any areas that look risky or worth a closer look?
 
 {pr_description}"
-        shift ;;
+        prompt_cli_set=true; shift ;;
       --prompt)
         if [[ -z "$2" || "$2" == -* ]]; then
           _tackle_err "--prompt requires a value"; return 2
         fi
-        prompt="$2"; shift 2 ;;
-      --prompt=*) prompt="${1#--prompt=}"; shift ;;
+        prompt="$2"; prompt_cli_set=true; shift 2 ;;
+      --prompt=*) prompt="${1#--prompt=}"; prompt_cli_set=true; shift ;;
       --add)
         if [[ -z "$2" || "$2" == -* ]]; then
           _tackle_err "--add requires a value"; return 2
@@ -379,6 +642,23 @@ _tackle_impl() {
         return 1
       fi
     fi
+
+    # Project config: run the on_done teardown hook (in the worktree) before
+    # removal — e.g. `docker compose down` to free ports. Honors --no-config and
+    # the trust gate; a config load error never blocks teardown.
+    if ! $no_config && [[ "${TACKLE_CONFIG:-on}" != "off" ]]; then
+      local branch
+      branch=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+      _cfg_dir=$(_tackle_cfg_run discover "$PWD" "$worktree_path")
+      if [[ -n "$_cfg_dir" ]]; then
+        _cfg_json=$(_tackle_cfg_run load "$_cfg_dir") || _cfg_json=""
+        if [[ -n "$_cfg_json" ]] && [[ "$(_tackle_cfg_list hooks.on_done | grep -c .)" -gt 0 ]]; then
+          _tackle_cfg_trust
+          $_cfg_run_hooks && _tackle_run_hooks on_done "$worktree_path" "$worktree_path"
+        fi
+      fi
+    fi
+
     cd "$main_repo" || return 1
     git worktree remove --force "$worktree_path" || {
       _tackle_err "failed to remove worktree at $worktree_path"
@@ -392,6 +672,7 @@ _tackle_impl() {
   if [[ -z "$input" ]]; then
     echo "usage: tackle <branch|PR-number|PR-url> [--no-agent|-na] [--install] [--time]" >&2
     echo "       tackle --new|-n <branch> [--base|-b <ref>]  (create a new branch)" >&2
+    echo "       tackle ... [--no-config] [--trust]          (project tackle.toml)" >&2
     echo "       tackle --done (inside a worktree)" >&2
     return 2
   fi
@@ -405,6 +686,57 @@ _tackle_impl() {
   if ! git rev-parse --git-dir &>/dev/null; then
     _tackle_err "not inside a git repository"
     return 1
+  fi
+
+  # ── resolve effective config: caller env > project config > .env file > default
+  # Personal .env file first (lowest project-agnostic layer) — it may set TACKLE_*.
+  local _env_file="${TACKLE_ENV_FILE:-${_TACKLE_SCRIPT_DIR:+${_TACKLE_SCRIPT_DIR}/.env}}"
+  if [[ -n "${_env_file:-}" && -f "$_env_file" ]]; then
+    # shellcheck source=/dev/null
+    source "$_env_file"
+  fi
+
+  # Project config: discover tackle.{toml,json} (+ .local) walking cwd → repo root,
+  # then load + merge. Skipped by --no-config / TACKLE_CONFIG=off.
+  if ! $no_config && [[ "${TACKLE_CONFIG:-on}" != "off" ]]; then
+    local _cfg_ceiling; _cfg_ceiling=$(git rev-parse --show-toplevel 2>/dev/null)
+    _cfg_dir=$(_tackle_cfg_run discover "$PWD" "$_cfg_ceiling")
+    if [[ -n "$_cfg_dir" ]]; then
+      _cfg_json=$(_tackle_cfg_run load "$_cfg_dir") || return 1
+      _tackle_log "loaded project config from $_cfg_dir"
+      # Advisory only (never mutate git): nudge if a tackle.local.* isn't ignored.
+      local _lf
+      for _lf in tackle.local.toml tackle.local.json; do
+        if [[ -f "$_cfg_dir/$_lf" ]] && ! git -C "$_cfg_dir" check-ignore -q "$_lf" 2>/dev/null; then
+          _tackle_warn "$_lf isn't gitignored — add 'tackle.local.*' to .gitignore to keep it out of commits"
+        fi
+      done
+    fi
+  fi
+
+  # Apply TACKLE_* precedence now that .env + project config are both known.
+  local _cfg_agent="" _cfg_template="" _cfg_prompt="" _cfg_deps=""
+  if [[ -n "$_cfg_json" ]]; then
+    _cfg_agent=$(_tackle_cfg_scalar agent)
+    _cfg_template=$(_tackle_cfg_scalar dir_template)
+    _cfg_prompt=$(_tackle_cfg_scalar prompt)
+    _cfg_deps=$(_tackle_cfg_scalar deps)
+  fi
+  agent="${_env_agent:-${_cfg_agent:-${TACKLE_AGENT:-claude}}}"
+  template="${_env_template:-${_cfg_template:-${TACKLE_DIR_TEMPLATE:-}}}"
+  [[ -z "$template" ]] && template='{repo}_{branch}'
+  if ! $prompt_cli_set; then
+    prompt="${_env_prompt:-${_cfg_prompt:-${TACKLE_PROMPT:-}}}"
+  fi
+  # deps: --no-deps (already forced) > caller TACKLE_DEPS > config.deps > .env > on
+  if ! $no_deps; then
+    if $_env_deps_set; then
+      [[ "$_env_deps" == off ]] && no_deps=true
+    elif [[ -n "$_cfg_deps" ]]; then
+      [[ "$_cfg_deps" == off ]] && no_deps=true
+    elif [[ "${TACKLE_DEPS:-on}" == off ]]; then
+      no_deps=true
+    fi
   fi
 
   local branch="$input"
@@ -645,6 +977,15 @@ print(t, end='')
     return 1
   fi
 
+  # Resolve trust once (covers every hook phase) and run pre_create BEFORE the
+  # worktree exists — a failing pre_create aborts cleanly with nothing created.
+  if [[ -n "$_cfg_json" ]] && _tackle_cfg_has_hooks; then
+    _tackle_cfg_trust
+    if $_cfg_run_hooks; then
+      _tackle_run_hooks pre_create "$main_repo" "" || return 1
+    fi
+  fi
+
   if $new_mode; then
     local _base="${base_ref:-HEAD}"
     _tackle_log "creating worktree at $worktree_path (new branch '$branch' from $_base) ..."
@@ -703,6 +1044,16 @@ print(t, end='')
                -o -type f \( -name '.env' -o -name '.env.*' \) -print 2>/dev/null)
     if [[ "$_env_copied" -gt 0 ]]; then
       _tackle_ok "copied $_env_copied unversioned .env file(s) from main repo"
+    fi
+  fi
+
+  # Project config: materialize declared copy/symlink paths, then run the setup
+  # hook (in the worktree). Materialize is ungated (it only moves files within
+  # your own checkout); setup is command execution, so it honors the trust gate.
+  if [[ -n "$_cfg_json" ]]; then
+    _tackle_cfg_materialize "$main_repo"
+    if $_cfg_run_hooks; then
+      _tackle_run_hooks setup "$worktree_path" "$worktree_path"
     fi
   fi
 

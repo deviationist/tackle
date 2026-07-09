@@ -33,6 +33,8 @@ tackle -n <branch> --base <ref>      # create a new branch off <ref> (short: -n 
 tackle <branch> --install            # force isolated install even if lockfile unchanged
 tackle <branch> --no-deps            # skip all dependency handling (no symlink, no install)
 tackle <branch> --no-env             # skip copying unversioned .env files into the worktree
+tackle <branch> --no-config          # ignore any project tackle.toml for this run
+tackle <branch> --trust              # pre-approve the project config's hook commands
 tackle <branch> --time               # prefix each step with a [HH:MM:SS] timestamp
 tackle <PR-url> --repo-check remote  # verify the URL's repo vs this checkout via gh
 tackle <branch> --review             # launch agent with built-in "what changed?" prompt
@@ -163,6 +165,63 @@ valid together with `--new`. In `--new` mode tackle skips all PR resolution (a
 brand-new branch has no PR) and errors early if the branch already exists (drop
 `--new` to check it out instead) or if `--base` names an unknown ref.
 
+## Project config (`tackle.toml`)
+
+Everything above is *personal* config (env vars + a co-located `.env`). A
+**`tackle.toml`** committed at the repo root lets **a project declare how to bring
+a worktree up to "running"** — extra files to materialise and setup/teardown
+commands — so a fresh worktree lands ready to work, not just checked out. tackle
+walks from your cwd up to the repo root to find it (so a monorepo subdir works),
+and a gitignored **`tackle.local.toml`** deep-merges on top for personal
+overrides (any key you set there replaces the base). A `tackle.json` /
+`tackle.local.json` with the same keys works too, if you'd rather not rely on a
+TOML parser (tackle uses Python's `tomllib`, 3.11+).
+
+```toml
+# tackle.toml — committed at the repo root
+agent        = "claude"                       # per-project TACKLE_* defaults
+dir_template = "{repo}_{branch}"
+prompt       = "/pr-review"
+deps         = "off"                          # skip dependency handling for this repo
+
+copy    = ["config/local.json", "certs/dev.pem"]   # copied  main repo → worktree
+symlink = ["big-assets"]                            # symlinked main repo → worktree
+
+[hooks]
+pre_create = ["docker compose config -q"]              # in the MAIN repo, before create; failure aborts
+setup      = ["pnpm build", "docker compose up -d db"]  # in the WORKTREE, after create; failure warns
+on_done    = ["docker compose down"]                    # in the worktree on --done, before removal
+```
+
+- **Keys.** `agent` / `dir_template` / `prompt` / `deps` map to the `TACKLE_*`
+  knobs. `copy` / `symlink` bring files the `.env` copy won't (paths are relative
+  to the repo root and must stay inside it — no absolute or `..` paths). `[hooks]`
+  are shell commands run with `$TACKLE_MAIN`, `$TACKLE_WORKTREE`, and
+  `$TACKLE_BRANCH` exported.
+- **Precedence** (high → low): CLI flag → caller env var → `tackle.local` → base
+  `tackle` → personal `.env` → built-in default. So a project can set its own
+  agent/prompt, and you can still override per-invocation.
+- **Hook failures:** `pre_create` is fatal (aborts before the worktree is
+  created); `setup` and `on_done` warn and continue (the worktree already exists —
+  better to let you fix it than tear it down).
+- **Trust.** Because a committed file that runs commands is a code-execution
+  surface, hook execution is gated by a **trust-on-first-use** prompt (à la
+  `direnv allow`). The first time a repo's hooks would run, tackle shows them and
+  asks `[o]nce / [a]lways / [s]kip`; `always` remembers the config's fingerprint
+  under `TACKLE_STATE_DIR` (default `~/.local/state/tackle`). If the config later
+  changes — including via the `tackle.local` layer or a `git pull` — the
+  fingerprint mismatches and tackle **re-prompts with a diff of what changed**, so
+  a slipped-in command can't run silently. Non-interactive runs (no TTY / closed
+  stdin) **skip** hooks rather than auto-run or hang. Config-only keys (agent,
+  template, `copy`/`symlink`) always apply — only command execution is gated.
+- **Escape hatches:** `--no-config` (or `TACKLE_CONFIG=off`) ignores the file for
+  a run; `--trust` pre-approves the hooks non-interactively (useful in scripts).
+- **gitignore:** add `tackle.local.*` to your `.gitignore`. tackle never edits
+  your git config, but it prints a one-line reminder if it loads a `tackle.local.*`
+  that isn't ignored.
+
+See [`tackle.example.toml`](tackle.example.toml) for a fully commented template.
+
 **`--done` / `--close`** uses `git worktree list` to locate the main repo and cd
 back to it. If there are uncommitted changes it lists them and prompts for
 confirmation before discarding.
@@ -254,6 +313,8 @@ for success (`✓`), yellow for warnings (`⚠`), red for errors (`✗`) on stde
 | `TACKLE_PNPM_SYMLINK` | _(unset)_ | Set `true` to allow symlink-reuse of a pnpm `node_modules` (only safe for flat/hoisted pnpm layouts) |
 | `TACKLE_ENV_FILE` | _(script dir)/.env_ | Path to an env file to source at startup; see below |
 | `TACKLE_COPY_ENV` | `true` | Copy unversioned `.env`/`.env.*` files into the worktree; set `false` (or pass `--no-env`) to skip |
+| `TACKLE_CONFIG` | `on` | Set `off` to ignore any project `tackle.toml` (same as `--no-config` on every run) |
+| `TACKLE_STATE_DIR` | `~/.local/state/tackle` | Where the project-config trust store lives |
 
 **Env file** — tackle auto-sources a `.env` in the same directory as
 `tackle.zsh` if one exists. This is where you keep your personal defaults without
