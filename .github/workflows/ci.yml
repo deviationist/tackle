@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. rapid re-pushes to a PR).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run both OSes to completion even if one fails — BSD (macOS) vs GNU
+      # (Linux) coreutils differences (cp/find/sed/ls) are exactly what this
+      # matrix is meant to catch.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        # The project-config loader parses tackle.toml via tomllib, which needs
+        # Python 3.11+. Pinning here keeps the TOML path exercised on every runner.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bats + zsh (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats zsh
+
+      - name: Install bats (macOS)
+        # zsh ships with macOS; git + python come from the runner / setup-python.
+        if: runner.os == 'macOS'
+        run: brew install bats-core
+
+      - name: Tool versions
+        run: |
+          bash --version | head -1
+          zsh --version
+          python3 --version
+          bats --version
+          git --version
+
+      - name: Run test suite
+        run: ./tests/run.sh
