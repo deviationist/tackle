@@ -27,7 +27,9 @@ tackle <branch>                      # create worktree, install deps, launch age
 tackle <PR-number>                   # resolve branch from PR number, then same
 tackle <PR-url>                      # resolve branch from PR URL, then same
 tackle <branch> --no-agent           # create worktree + install deps, no agent
-tackle <branch> -n                   # same as --no-agent
+tackle <branch> -na                  # same as --no-agent
+tackle --new <branch>                # create a NEW branch off HEAD, then same
+tackle -n <branch> --base <ref>      # create a new branch off <ref> (short: -n / -b)
 tackle <branch> --install            # force full install even if lockfile unchanged
 tackle <branch> --no-env             # skip copying unversioned .env files into the worktree
 tackle <branch> --time               # prefix each step with a [HH:MM:SS] timestamp
@@ -104,6 +106,21 @@ Disable per-run with `--no-env`, or persistently with `TACKLE_COPY_ENV=false`.
 
 The worktree is created at `../<template>` (default: `<repo>_<branch>`). If the
 branch doesn't exist locally it's fetched from origin first.
+
+**`--new` / `-n` — start a new branch.** By default tackle only works with
+branches that already exist locally or on `origin`. Pass `--new` to *create* the
+branch as part of spinning up the worktree — the equivalent of
+`git worktree add -b <branch>`:
+
+```bash
+tackle --new feature/my-idea            # new branch off HEAD, worktree, deps, agent
+tackle -n feature/my-idea --base main   # new branch off main instead of HEAD
+```
+
+`--base` / `-b <ref>` picks what to branch from (default: `HEAD`); it's only
+valid together with `--new`. In `--new` mode tackle skips all PR resolution (a
+brand-new branch has no PR) and errors early if the branch already exists (drop
+`--new` to check it out instead) or if `--base` names an unknown ref.
 
 **`--done` / `--close`** uses `git worktree list` to locate the main repo and cd
 back to it. If there are uncommitted changes it lists them and prompts for

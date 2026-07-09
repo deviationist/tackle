@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # tackle — git worktree add + install deps + optional AI agent session.
 # Creates a sibling directory named by TACKLE_DIR_TEMPLATE, installs deps,
-# and drops you into an agent session (pass -n/--no-agent to skip).
+# and drops you into an agent session (pass -na/--no-agent to skip).
 #
 # Usage:
 #   tackle <branch>                      # create worktree, install deps, launch agent
 #   tackle <PR-number>                   # resolve branch from PR number, then same
 #   tackle <PR-url>                      # resolve branch from PR URL, then same
 #   tackle <branch> --no-agent           # create worktree + install deps, no agent
-#   tackle <branch> -n                   # same as --no-agent
+#   tackle <branch> -na                  # same as --no-agent
+#   tackle --new <branch>                # create a NEW branch (off HEAD) + worktree
+#   tackle -n <branch> --base <ref>      # create a new branch off <ref> (short forms)
 #   tackle <branch> --install            # force full install even if lockfile unchanged
 #   tackle <branch> --no-env             # skip copying unversioned .env files into the worktree
 #   tackle <branch> --time               # prefix each step with a [HH:MM:SS] timestamp
@@ -94,6 +96,8 @@ _tackle_impl() {
   local input=""
   local launch_agent=true
   local done_mode=false
+  local new_mode=false     # --new: create the branch instead of resolving an existing one
+  local base_ref=""        # --base: ref to branch from in --new mode (default HEAD)
   local force_install=false
   local show_time=false
   # Copy unversioned .env files into the worktree by default; TACKLE_COPY_ENV=false
@@ -150,7 +154,14 @@ _tackle_impl() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --no-agent|--no-claude|-n) launch_agent=false; shift ;;
+      --no-agent|--no-claude|-na) launch_agent=false; shift ;;
+      --new|-n)                  new_mode=true;       shift ;;
+      --base|-b)
+        if [[ -z "$2" || "$2" == -* ]]; then
+          _tackle_err "--base requires a value (a ref to branch from)"; return 2
+        fi
+        base_ref="$2"; shift 2 ;;
+      --base=*)                  base_ref="${1#--base=}"; shift ;;
       --done|--close|--exit)     done_mode=true;      shift ;;
       --install)                 force_install=true;  shift ;;
       --no-env)                  copy_env=false;      shift ;;
@@ -255,8 +266,15 @@ _tackle_impl() {
 
   # Create mode
   if [[ -z "$input" ]]; then
-    echo "usage: tackle <branch|PR-number|PR-url> [--no-agent|-n] [--install] [--time]" >&2
+    echo "usage: tackle <branch|PR-number|PR-url> [--no-agent|-na] [--install] [--time]" >&2
+    echo "       tackle --new|-n <branch> [--base|-b <ref>]  (create a new branch)" >&2
     echo "       tackle --done (inside a worktree)" >&2
+    return 2
+  fi
+
+  # --base only makes sense when creating a branch.
+  if [[ -n "$base_ref" ]] && ! $new_mode; then
+    _tackle_err "--base is only valid with --new"
     return 2
   fi
 
@@ -268,11 +286,23 @@ _tackle_impl() {
   local branch="$input"
   local pr_number="" pr_title="" pr_body=""
 
+  # --new: validate up front so we fail before building the worktree path.
+  if $new_mode; then
+    if git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1; then
+      _tackle_err "branch '$branch' already exists — drop --new to check it out"
+      return 1
+    fi
+    if [[ -n "$base_ref" ]] && ! git rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
+      _tackle_err "--base '$base_ref' is not a valid ref"
+      return 1
+    fi
+  fi
+
   # Resolve PR number or URL → branch name via gh CLI.
   # Always fetch number + title (cheap). Only add body to the request when
   # {pr_description} is actually referenced in the prompt — avoids fetching
   # potentially large PR bodies that won't be used.
-  if [[ "$branch" =~ ^[0-9]+$ ]] || [[ "$branch" == *"/pull/"* ]]; then
+  if ! $new_mode && { [[ "$branch" =~ ^[0-9]+$ ]] || [[ "$branch" == *"/pull/"* ]]; }; then
     # A PR *URL* carries its own owner/repo. If it points at a different GitHub
     # repo than this checkout, resolving it here is wrong: we'd pull the PR's
     # metadata from the URL's repo but then try to check out its head branch in
@@ -365,7 +395,7 @@ else:
 
   # For plain branch inputs (no PR resolved yet), try to auto-resolve an open
   # PR via gh CLI. Handles 1, multiple, and 0 results differently.
-  if [[ -z "$pr_number" ]] && command -v gh &>/dev/null; then
+  if ! $new_mode && [[ -z "$pr_number" ]] && command -v gh &>/dev/null; then
     local _auto_fields="number,title"
     [[ "$prompt" == *"{pr_description}"* ]] && _auto_fields="$_auto_fields,body"
     local _pr_list
@@ -491,16 +521,22 @@ print(t, end='')
     return 1
   fi
 
-  if ! git rev-parse --verify "$branch" &>/dev/null; then
-    _tackle_log "fetching $branch from origin ..."
-    git fetch origin "$branch":"$branch" || {
-      _tackle_err "could not fetch branch '$branch' from origin"
-      return 1
-    }
-  fi
+  if $new_mode; then
+    local _base="${base_ref:-HEAD}"
+    _tackle_log "creating worktree at $worktree_path (new branch '$branch' from $_base) ..."
+    git worktree add -b "$branch" "$worktree_path" "$_base" || return 1
+  else
+    if ! git rev-parse --verify "$branch" &>/dev/null; then
+      _tackle_log "fetching $branch from origin ..."
+      git fetch origin "$branch":"$branch" || {
+        _tackle_err "could not fetch branch '$branch' from origin"
+        return 1
+      }
+    fi
 
-  _tackle_log "creating worktree at $worktree_path ..."
-  git worktree add "$worktree_path" "$branch" || return 1
+    _tackle_log "creating worktree at $worktree_path ..."
+    git worktree add "$worktree_path" "$branch" || return 1
+  fi
 
   cd "$worktree_path" || return 1
 
