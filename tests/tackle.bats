@@ -276,6 +276,80 @@ setup() {
   [ -d "$BATS_TEST_TMPDIR/repo_remote-only" ]
 }
 
+# ── new-branch mode (--new / -n, --base / -b) ────────────────────────────────
+
+@test "--new creates a brand-new branch off HEAD and its worktree" {
+  cd "$REPO"
+  run tackle --new brand-new --no-agent
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"new branch 'brand-new'"* ]]
+  [ -d "$BATS_TEST_TMPDIR/repo_brand-new" ]
+  run git -C "$BATS_TEST_TMPDIR/repo_brand-new" rev-parse --abbrev-ref HEAD
+  [ "$output" = "brand-new" ]
+  # branched off HEAD → same commit as the main checkout
+  [ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$REPO" rev-parse brand-new)" ]
+}
+
+@test "--base branches off the given ref (short forms -n / -b)" {
+  # Give 'feature' a commit of its own so it diverges from HEAD.
+  git -C "$REPO" checkout -q feature
+  printf 'x\n' > "$REPO/apps/web/extra.js"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -q -m "feature-only"
+  git -C "$REPO" checkout -q -             # back to the default branch
+  cd "$REPO"
+  run tackle -n off-feature -b feature --no-agent
+  [ "$status" -eq 0 ]
+  [ -d "$BATS_TEST_TMPDIR/repo_off-feature" ]
+  # new branch points at feature's tip, not HEAD's
+  [ "$(git -C "$REPO" rev-parse feature)" = "$(git -C "$REPO" rev-parse off-feature)" ]
+  [ "$(git -C "$REPO" rev-parse HEAD)" != "$(git -C "$REPO" rev-parse off-feature)" ]
+}
+
+@test "--new errors when the branch already exists" {
+  cd "$REPO"
+  run tackle --new feature --no-agent      # 'feature' exists from init_repo
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already exists"* ]]
+  [ ! -d "$BATS_TEST_TMPDIR/repo_feature" ]
+}
+
+@test "--base with an unknown ref errors before creating anything" {
+  cd "$REPO"
+  run tackle --new fresh --base nope-nope --no-agent
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not a valid ref"* ]]
+  [ ! -d "$BATS_TEST_TMPDIR/repo_fresh" ]
+}
+
+@test "--base without --new is rejected" {
+  cd "$REPO"
+  run tackle feature --base main --no-agent
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"only valid with --new"* ]]
+}
+
+@test "--new skips PR resolution for a numeric branch name" {
+  # A bare number would normally be treated as a PR; --new must not.
+  export GH_STUB_PRVIEW='{"headRefName":"should-not-be-used","number":9,"title":"nope"}'
+  cd "$REPO"
+  run tackle --new 123 --no-agent
+  [ "$status" -eq 0 ]
+  [ -d "$BATS_TEST_TMPDIR/repo_123" ]
+  run git -C "$BATS_TEST_TMPDIR/repo_123" rev-parse --abbrev-ref HEAD
+  [ "$output" = "123" ]
+}
+
+@test "-na is the short form for --no-agent (agent not launched)" {
+  use_recording_agent "$BATS_TEST_TMPDIR/prompt.txt"
+  cd "$REPO"
+  run tackle feature -na
+  [ "$status" -eq 0 ]
+  [ -d "$BATS_TEST_TMPDIR/repo_feature" ]
+  # the recording agent writes prompt.txt only if launched; -na must skip it
+  [ ! -f "$BATS_TEST_TMPDIR/prompt.txt" ]
+}
+
 # ── cross-repo guard for PR URLs (--repo-check) ──────────────────────────────
 
 @test "local mode: a PR URL for a different repo than origin fails early" {
