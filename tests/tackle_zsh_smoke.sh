@@ -44,4 +44,27 @@ cd "$TMP/repo_feature/"
 tackle --done
 [[ ! -d "$TMP/repo_feature" ]] || { print -r -- "FAIL: worktree not removed"; exit 1 }
 
-print -r -- "zsh smoke: OK (create + --done under zsh $ZSH_VERSION)"
+# ── dependency registry under real zsh ───────────────────────────────────────
+# The registry loop leans on constructs that behave differently in zsh than bash
+# (quoted array-by-value iteration, `IFS='|' read <<<`, `${//,/$'\n'}` splitting,
+# and zsh's no-word-split-on-unquoted-$var). Exercise it via the hermetic symlink
+# path (identical lockfile + non-empty main node_modules → symlink, no installer
+# binary needed) so a zsh-only parsing regression can't slip past the bash suite.
+git init -q "$TMP/deprepo"
+git -C "$TMP/deprepo" config user.email test@example.com
+git -C "$TMP/deprepo" config user.name  tester
+printf '{}\n'      > "$TMP/deprepo/package.json"
+printf 'lock-v1\n' > "$TMP/deprepo/package-lock.json"
+git -C "$TMP/deprepo" add -A
+git -C "$TMP/deprepo" commit -q -m deps
+git -C "$TMP/deprepo" branch feature
+mkdir -p "$TMP/deprepo/node_modules/foo"      # non-empty deps dir in main
+
+cd "$TMP/deprepo"
+tackle feature --no-agent
+[[ -L "$TMP/deprepo_feature/node_modules" ]] \
+  || { print -r -- "FAIL: node_modules not symlinked under zsh"; exit 1 }
+[[ -d "$TMP/deprepo_feature/node_modules/foo" ]] \
+  || { print -r -- "FAIL: symlinked node_modules does not resolve to main's"; exit 1 }
+
+print -r -- "zsh smoke: OK (create + --done + dep-registry under zsh $ZSH_VERSION)"
