@@ -1,0 +1,41 @@
+# tackle.example.toml — copy to `tackle.toml` at your repo root and edit.
+#
+# This file declares how tackle should bring a fresh worktree up to "running".
+# It travels with the repo (commit it). Personal, machine-specific overrides go
+# in a gitignored `tackle.local.toml` beside it, which deep-merges on top (any
+# key you set there replaces the same key here).
+#
+# A `tackle.json` / `tackle.local.json` with the same keys works too, if you'd
+# rather not depend on a TOML parser (tackle uses Python's tomllib, 3.11+).
+#
+# Precedence for the settings below:
+#   CLI flag  >  caller env var  >  tackle.local  >  tackle (this file)  >  ~/.env default
+
+# ── per-project defaults (map to the TACKLE_* knobs) ─────────────────────────
+# agent        = "claude"            # binary tackle launches in the worktree
+# dir_template = "{repo}_{branch}"   # worktree dir name; {repo} {branch} {input}
+# prompt       = "/pr-review"        # initial prompt handed to the agent
+# deps         = "on"                # "off" to skip all dependency handling
+
+# ── extra files to bring into the worktree ───────────────────────────────────
+# `git worktree add` only checks out *tracked* files. tackle already copies
+# unversioned `.env` files automatically; list anything else here. Paths are
+# relative to the repo root and must stay inside it (no leading / or ..).
+#
+# copy    = ["config/local.json", "certs/dev.pem"]  # copied  (per-worktree, edits stay local)
+# symlink = ["big-assets"]                           # symlinked to the main repo (shared)
+
+# ── setup / teardown hooks ───────────────────────────────────────────────────
+# Shell commands that make the worktree actually runnable. Each runs through the
+# shell with $TACKLE_MAIN (main repo path), $TACKLE_WORKTREE (new worktree path,
+# empty during pre_create), and $TACKLE_BRANCH exported.
+#
+# Because a committed file that runs commands is a code-execution surface, tackle
+# gates hooks behind a trust-on-first-use prompt (per repo; it re-prompts with a
+# diff if this file later changes). Pre-approve non-interactively with `--trust`;
+# ignore the whole file for one run with `--no-config`.
+#
+# [hooks]
+# pre_create = ["docker compose config -q"]              # in the MAIN repo, before the worktree is made; failure aborts
+# setup      = ["pnpm build", "docker compose up -d db"]  # in the WORKTREE, after create + deps; failure warns, keeps going
+# on_done    = ["docker compose down"]                    # in the worktree on `tackle --done`, before it's removed

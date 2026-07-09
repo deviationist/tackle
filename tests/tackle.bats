@@ -872,3 +872,228 @@ _seed_js_repo() {
   [ "$status" -eq 0 ]
   [[ "$output" =~ \[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] ]]
 }
+
+# ── project config (tackle.toml / tackle.local.toml) ─────────────────────────
+# Trust store is isolated per-test via TACKLE_STATE_DIR (see helpers.bash), so
+# every repo starts untrusted. Hook tests pass --trust to bypass the prompt;
+# the trust-flow tests exercise the prompt itself by feeding stdin.
+
+@test "project config: prompt default comes from tackle.toml" {
+  use_recording_agent "$BATS_TEST_TMPDIR/prompt.txt"
+  printf 'prompt = "hello from config"\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"loaded project config"* ]]
+  run cat "$BATS_TEST_TMPDIR/prompt.txt"
+  [ "$output" = "hello from config" ]
+}
+
+@test "project config: caller env var wins over the config value" {
+  use_recording_agent "$BATS_TEST_TMPDIR/prompt.txt"
+  printf 'prompt = "cfg"\n' > "$REPO/tackle.toml"
+  export TACKLE_PROMPT="caller"
+  cd "$REPO"
+  run tackle feature
+  unset TACKLE_PROMPT
+  [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/prompt.txt"
+  [ "$output" = "caller" ]
+}
+
+@test "project config: dir_template from config names the worktree" {
+  unset TACKLE_DIR_TEMPLATE     # harness sets this as caller env, which outranks config
+  printf 'dir_template = "wt-{branch}"\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ -d "$BATS_TEST_TMPDIR/wt-feature" ]
+}
+
+@test "project config: tackle.local overrides the base file" {
+  use_recording_agent "$BATS_TEST_TMPDIR/prompt.txt"
+  printf 'prompt = "base"\n'       > "$REPO/tackle.toml"
+  printf 'prompt = "local-wins"\n' > "$REPO/tackle.local.toml"
+  cd "$REPO"
+  run tackle feature
+  [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/prompt.txt"
+  [ "$output" = "local-wins" ]
+}
+
+@test "project config: a tackle.json is honored" {
+  use_recording_agent "$BATS_TEST_TMPDIR/prompt.txt"
+  printf '{ "prompt": "from-json" }\n' > "$REPO/tackle.json"
+  cd "$REPO"
+  run tackle feature
+  [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/prompt.txt"
+  [ "$output" = "from-json" ]
+}
+
+@test "project config: copy materializes a file into the worktree" {
+  printf 'secret\n' > "$REPO/config.local"
+  printf 'copy = ["config.local"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ -f "$BATS_TEST_TMPDIR/repo_feature/config.local" ]
+  run cat "$BATS_TEST_TMPDIR/repo_feature/config.local"
+  [ "$output" = "secret" ]
+}
+
+@test "project config: symlink links a path back to the main repo" {
+  mkdir -p "$REPO/assets"; printf 'a\n' > "$REPO/assets/big"
+  printf 'symlink = ["assets"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ -L "$BATS_TEST_TMPDIR/repo_feature/assets" ]
+}
+
+@test "project config: an unsafe copy path is rejected" {
+  printf 'copy = ["../escape"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unsafe copy path"* ]]
+  [ ! -d "$BATS_TEST_TMPDIR/repo_feature" ]
+}
+
+@test "project config: deps=\"off\" skips dependency handling" {
+  write_install_stub npm
+  printf '{}\n' > "$REPO/package.json"
+  git -C "$REPO" add -A; git -C "$REPO" commit -q -m pkg
+  printf 'deps = "off"\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle --new feat_deps --no-agent
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"dependency handling disabled"* ]]
+}
+
+@test "project config: setup hook runs in the worktree when trusted" {
+  printf '[hooks]\nsetup = ["echo hi > setup_ran"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent --trust
+  [ "$status" -eq 0 ]
+  [ -f "$BATS_TEST_TMPDIR/repo_feature/setup_ran" ]
+}
+
+@test "project config: pre_create runs in the main repo before creation" {
+  printf '[hooks]\npre_create = ["echo $TACKLE_BRANCH > pre_ran"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent --trust
+  [ "$status" -eq 0 ]
+  [ -f "$REPO/pre_ran" ]                       # written in the MAIN repo (pre_create cwd)
+  run cat "$REPO/pre_ran"
+  [ "$output" = "feature" ]
+}
+
+@test "project config: a failing pre_create aborts before creating the worktree" {
+  printf '[hooks]\npre_create = ["exit 3"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent --trust
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"pre_create hook failed"* ]]
+  [ ! -d "$BATS_TEST_TMPDIR/repo_feature" ]
+}
+
+@test "project config: a failing setup hook warns but keeps the worktree" {
+  printf '[hooks]\nsetup = ["exit 4"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent --trust
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"hook[setup] failed"* ]]
+  [ -d "$BATS_TEST_TMPDIR/repo_feature" ]
+}
+
+@test "project config: on_done hook runs on --done when trusted" {
+  # Config must be committed so the worktree (a fresh branch off HEAD) has it.
+  printf '[hooks]\non_done = ["echo bye > $TACKLE_MAIN/done_marker"]\n' > "$REPO/tackle.toml"
+  git -C "$REPO" add -A; git -C "$REPO" commit -q -m cfg
+  cd "$REPO"
+  run tackle --new feat_done --no-agent --trust
+  [ "$status" -eq 0 ]
+  [ -f "$BATS_TEST_TMPDIR/repo_feat_done/tackle.toml" ]   # config present in worktree
+  cd "$BATS_TEST_TMPDIR/repo_feat_done"
+  run tackle --done --trust
+  [ "$status" -eq 0 ]
+  [ -f "$REPO/done_marker" ]                              # on_done wrote into main repo
+}
+
+@test "project config: hooks skipped without trust, config-only keys still apply" {
+  use_recording_agent "$BATS_TEST_TMPDIR/prompt.txt"
+  printf 'prompt = "cfg-prompt"\n[hooks]\nsetup = ["echo x > setup_ran"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature < /dev/null              # no stdin → trust prompt gets EOF → skip
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipped hooks"* ]]
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feature/setup_ran" ]     # hook skipped
+  run cat "$BATS_TEST_TMPDIR/prompt.txt"
+  [ "$output" = "cfg-prompt" ]                            # config key still applied
+}
+
+@test "project config: 'always' persists trust across runs" {
+  printf '[hooks]\nsetup = ["echo x > setup_ran"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent <<< "a"       # first time → prompt → always
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"first time here"* ]]
+  [ -f "$BATS_TEST_TMPDIR/repo_feature/setup_ran" ]
+  cd "$REPO"
+  run tackle --new feat2 --no-agent < /dev/null   # unchanged config → trusted, no prompt
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"first time here"* ]]
+  [ -f "$BATS_TEST_TMPDIR/repo_feat2/setup_ran" ]
+}
+
+@test "project config: a changed config re-triggers the trust prompt" {
+  printf '[hooks]\nsetup = ["echo a > setup_ran"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent <<< "a"       # trust always
+  [ "$status" -eq 0 ]
+  printf '[hooks]\nsetup = ["echo a > setup_ran", "echo b > extra_ran"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle --new feat2 --no-agent < /dev/null   # changed → prompt again → EOF skips
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CHANGED"* ]]
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feat2/setup_ran" ]
+}
+
+@test "project config: --no-config ignores the file entirely" {
+  printf '[hooks]\nsetup = ["echo x > setup_ran"]\n' > "$REPO/tackle.toml"
+  cd "$REPO"
+  run tackle feature --no-agent --no-config --trust
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"loaded project config"* ]]
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feature/setup_ran" ]
+}
+
+@test "project config: TACKLE_CONFIG=off ignores the file" {
+  printf '[hooks]\nsetup = ["echo x > setup_ran"]\n' > "$REPO/tackle.toml"
+  export TACKLE_CONFIG=off
+  cd "$REPO"
+  run tackle feature --no-agent --trust
+  unset TACKLE_CONFIG
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/repo_feature/setup_ran" ]
+}
+
+@test "project config: warns when tackle.local isn't gitignored" {
+  printf 'prompt = "x"\n'       > "$REPO/tackle.toml"
+  printf 'prompt = "y"\n'       > "$REPO/tackle.local.toml"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"isn't gitignored"* ]]
+}
+
+@test "project config: no warning when tackle.local is gitignored" {
+  printf 'prompt = "x"\n'          > "$REPO/tackle.toml"
+  printf 'prompt = "y"\n'          > "$REPO/tackle.local.toml"
+  printf 'tackle.local.*\n'        > "$REPO/.gitignore"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"isn't gitignored"* ]]
+}
