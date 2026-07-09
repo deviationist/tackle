@@ -1,5 +1,7 @@
 # tackle
 
+[![CI](https://github.com/deviationist/tackle/actions/workflows/ci.yml/badge.svg)](https://github.com/deviationist/tackle/actions/workflows/ci.yml)
+
 Turn a branch or PR into a ready-to-work, isolated git worktree — dependencies
 reused instead of reinstalled, unversioned `.env` files copied, and an AI agent
 session launched already primed on what changed and why. The git plumbing, dep
