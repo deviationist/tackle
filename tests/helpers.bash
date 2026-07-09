@@ -22,7 +22,10 @@ tackle_setup() {
   export TACKLE_AGENT=true
   # Deterministic worktree naming.
   export TACKLE_DIR_TEMPLATE='{repo}_{branch}'
-  unset TACKLE_PROMPT TACKLE_COPY_ENV
+  unset TACKLE_PROMPT TACKLE_COPY_ENV TACKLE_DEPS TACKLE_CONFIG
+  # Isolate the project-config trust store so tests never read or write the
+  # operator's real ~/.local/state/tackle and start from an untrusted state.
+  export TACKLE_STATE_DIR="$BATS_TEST_TMPDIR/state"
 
   # Hermetic stubs ahead of the real binaries on PATH.
   mkdir -p "$BATS_TEST_TMPDIR/bin"
