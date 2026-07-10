@@ -87,10 +87,11 @@ this branch" (never a comparison of the installed tree):
 
 - **Reuse (symlink) — instant, zero-copy** — used only when *all* hold: the
   ecosystem's install dir is safely shareable by a plain root symlink (flat trees:
-  npm/yarn), the lockfile(s) are byte-identical between the main repo and the
-  worktree, and the main tree exists and is non-empty. The symlink is added to
-  `.git/info/exclude` so git doesn't show it as untracked. A warning notes that dep
-  mutations here (e.g. adding a package) affect the shared main-repo tree.
+  npm/yarn; an in-project Python `.venv`), the lockfile(s) are byte-identical
+  between the main repo and the worktree, and the main tree exists and is non-empty.
+  The symlink is added to `.git/info/exclude` so git doesn't show it as untracked. A
+  warning notes that dep mutations here (e.g. adding a package) affect the shared
+  main-repo tree.
 - **Install** — used otherwise (lockfile differs, or the layout isn't safely
   root-symlinkable). tackle runs the ecosystem's own install command, which is fast
   off its warm global cache (pnpm hardlinks, cargo/go/pip caches — no re-download).
@@ -104,9 +105,9 @@ The registry (add a package manager = add a row):
 | npm | `package-lock.json` / `package.json` | `node_modules` | Yes | `npm i` |
 | Rust (cargo) | `Cargo.lock` | `target` | No² | `cargo fetch` |
 | Go | `go.sum` | — | No² | `go mod download` |
-| Python (poetry) | `poetry.lock` | `.venv` | No³ | `poetry install` |
-| Python (uv) | `uv.lock` | `.venv` | No³ | `uv sync` |
-| Python (pip) | `requirements.txt` | `.venv` | No³ | `pip install -r requirements.txt` |
+| Python (uv) | `uv.lock`, or `pyproject.toml` `[tool.uv]` | `.venv` | Yes³ | `uv sync` |
+| Python (poetry) | `poetry.lock`, or `pyproject.toml` `[tool.poetry]` | `.venv` | Yes³ | `poetry install` (in-project) |
+| Python (pip) | `requirements.txt`, or a bare `pyproject.toml` | `.venv` | Yes³ | `python -m venv .venv && pip install …` |
 
 ¹ pnpm's strict/nested `node_modules` (one root + one per workspace package) isn't
 fully materialised by a single root symlink, so pnpm defaults to install. Opt in to
@@ -114,8 +115,18 @@ symlink-reuse for known-flat layouts with `TACKLE_PNPM_SYMLINK=true`, or a
 `node-linker=hoisted` line in `.npmrc` / `nodeLinker: hoisted` in
 `pnpm-workspace.yaml`. ² cargo/go materialise from a shared global cache, so a
 build in the worktree is already fast; there's no in-tree tree worth symlinking.
-³ Python virtualenvs bake absolute paths and are never relocatable, so they are
-never symlinked.
+
+³ **Python** is detected most-specific first: `uv.lock` / `poetry.lock` (unambiguous)
+→ a `pyproject.toml` `[tool.uv]` / `[tool.poetry]` declaration → `requirements.txt`
+→ a bare `pyproject.toml`. This reads what the project *declares* rather than
+tripping on a stray `requirements.txt` a uv/poetry repo also ships. Each install
+command builds an **in-project `.venv`** so a fresh worktree is runnable (VS Code
+finds the interpreter). A `.venv` is **reused by symlink** when the lockfile is
+unchanged — but **never copied**: its scripts hard-code absolute interpreter paths,
+so a copy would point back at the main repo. Repos whose venv is built by a *wrapper*
+(Bazel, `make`, `nox`, …) fall outside detection — declare it in `tackle.toml`
+(`symlink = [".venv"]` or a `setup` hook). Only an in-project `.venv` is handled; a
+`venv/`-named or out-of-tree (default poetry) virtualenv isn't symlinked.
 
 **Bazel workspaces** (`MODULE.bazel` / `WORKSPACE` / `WORKSPACE.bazel`) skip in-tree
 dependency handling entirely: Bazel owns out-of-tree caches (e.g.

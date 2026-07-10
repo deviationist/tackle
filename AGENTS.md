@@ -10,12 +10,18 @@ ready-to-work, isolated git worktree with an AI agent primed on the change.
   0 → branch-only).
 - **Dependency handling is language-agnostic** (registry: JS pnpm/yarn/npm, Rust,
   Go, Python). Per ecosystem it byte-compares the lockfile main-vs-worktree and
-  symlinks a shared flat `node_modules` only when it's safe *and* the lockfile
-  matches; otherwise it runs a cache-backed install. pnpm defaults to install
-  (opt into symlink with `TACKLE_PNPM_SYMLINK=true` / `node-linker=hoisted`). Bazel
-  workspaces (`MODULE.bazel`/`WORKSPACE`) skip in-tree reuse. `--install` forces an
-  isolated install; `--no-deps` (or `TACKLE_DEPS=off`) skips dependency handling.
-  Only root-level lockfiles are compared.
+  symlinks the shared install dir (flat `node_modules`; an in-project Python
+  `.venv`) only when it's safe *and* the lockfile matches; otherwise it runs a
+  cache-backed install. pnpm defaults to install (opt into symlink with
+  `TACKLE_PNPM_SYMLINK=true` / `node-linker=hoisted`). **Python** is detected
+  most-specific first — `uv.lock`/`poetry.lock`, then a `pyproject.toml`
+  `[tool.uv]`/`[tool.poetry]` declaration, then `requirements.txt`, then a bare
+  `pyproject.toml` — and each install command builds an in-project `.venv`; venvs
+  are reused by symlink only (never copied — they bake absolute interpreter paths).
+  Bazel workspaces (`MODULE.bazel`/`WORKSPACE`) skip in-tree reuse (use a
+  `tackle.toml` hook/symlink for their venv). `--install` forces an isolated
+  install; `--no-deps` (or `TACKLE_DEPS=off`) skips dependency handling. Only
+  root-level lockfiles are compared.
 - **New branches**: `--new` / `-n <branch>` creates the branch as part of the
   worktree (`git worktree add -b`) instead of requiring it to exist; `--base` /
   `-b <ref>` picks what to branch from (default `HEAD`, only valid with `--new`).
