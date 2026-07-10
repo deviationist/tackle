@@ -31,13 +31,19 @@
 # _tackle_setup_deps). For each package manager detected in the worktree, tackle
 # byte-compares the lockfile(s) against the main repo. It symlinks the main repo's
 # install dir into the worktree ONLY when that dir is safely shareable by a plain
-# root symlink (flat trees: npm/yarn) AND the lockfiles are identical AND the main
-# tree is non-empty — instant, zero-copy. Otherwise it runs that ecosystem's own
-# install command (fast off the warm global cache). pnpm defaults to install (its
-# strict/nested node_modules isn't safely root-symlinkable); opt in with
-# TACKLE_PNPM_SYMLINK=true or a node-linker=hoisted config. Bazel workspaces
-# (MODULE.bazel/WORKSPACE) skip in-tree reuse entirely (Bazel owns out-of-tree
-# caches). Pass --install to force an isolated install; --no-deps to skip entirely.
+# root symlink (flat trees: npm/yarn; an in-project Python .venv) AND the lockfiles
+# are identical AND the main tree is non-empty — instant, zero-copy. Otherwise it
+# runs that ecosystem's own install command (fast off the warm global cache).
+# pnpm defaults to install (its strict/nested node_modules isn't safely
+# root-symlinkable); opt in with TACKLE_PNPM_SYMLINK=true or a node-linker=hoisted
+# config. Python is detected most-specific first (uv.lock / poetry.lock, then a
+# pyproject.toml [tool.uv]/[tool.poetry] declaration, then requirements.txt, then a
+# bare pyproject); each install command builds an in-project .venv so a fresh
+# worktree is runnable. A .venv is only ever reused by SYMLINK, never copied — its
+# scripts bake in absolute interpreter paths, so a copy would point back at main.
+# Bazel workspaces (MODULE.bazel/WORKSPACE) skip in-tree reuse entirely (Bazel owns
+# out-of-tree caches; use a tackle.toml hook/symlink there). Pass --install to
+# force an isolated install; --no-deps to skip entirely.
 #
 # Unversioned .env files in the main repo are copied into the worktree (git only
 # checks out tracked files, so gitignored secrets would otherwise be missing).
@@ -223,6 +229,21 @@ _tackle_impl() {
     _tackle_warn "dep changes here (e.g. adding packages) will affect the main repo — use --install to isolate"
   }
 
+  # Registry marker test. A plain marker is a filename (does it exist?). A
+  # "file@section" marker ALSO requires a TOML table header — e.g.
+  # `pyproject.toml@tool\.uv` matches only when pyproject.toml declares [tool.uv]
+  # (or a [tool.uv.*] subtable). This is what lets Python detection tell uv from
+  # poetry from pip by what pyproject.toml actually declares, not merely which
+  # files happen to exist (a uv/poetry repo often also ships a requirements.txt).
+  _tackle_dep_marker_present() {
+    local spec="$1" f sec
+    case "$spec" in
+      *@*) f="${spec%@*}"; sec="${spec#*@}"
+           [[ -f "$f" ]] && grep -qE "^[[:space:]]*\[${sec}[].]" "$f" 2>/dev/null ;;
+      *)   [[ -f "$spec" ]] ;;
+    esac
+  }
+
   _tackle_setup_deps() {              # $1 = main worktree path; cwd = new worktree
     local main_repo="$1"
 
@@ -244,6 +265,13 @@ _tackle_impl() {
     # Rows scan top-to-bottom; the first match within a `family` wins (pnpm>yarn>npm
     # — they share node_modules), while different families are all handled so
     # multilingual repos install every ecosystem present. Add a manager = add a row.
+    #
+    # Python is detected most-specific first: uv.lock / poetry.lock (unambiguous),
+    # then a pyproject.toml [tool.uv] / [tool.poetry] declaration (a "file@section"
+    # marker), then requirements.txt, then a bare pyproject. A venv is reused by
+    # SYMLINK (never copy — its scripts bake in absolute interpreter paths, so a
+    # copy would point back at the main repo); the install commands each produce an
+    # in-project .venv so a fresh worktree is actually runnable (VS Code, etc.).
     local _rows=(
       'pnpm|js|pnpm-lock.yaml|pnpm-lock.yaml|node_modules|no|pnpm i'
       'yarn|js|yarn.lock|yarn.lock|node_modules|yes|yarn'
@@ -251,15 +279,18 @@ _tackle_impl() {
       'npm|js|package.json|package.json|node_modules|yes|npm i'
       'cargo|rust|Cargo.lock|Cargo.lock|target|no|cargo fetch'
       'go|go|go.sum|go.sum||no|go mod download'
-      'poetry|python|poetry.lock|poetry.lock|.venv|no|poetry install'
-      'uv|python|uv.lock|uv.lock|.venv|no|uv sync'
-      'pip|python|requirements.txt|requirements.txt|.venv|no|pip install -r requirements.txt'
+      'uv|python|uv.lock|uv.lock|.venv|yes|uv sync'
+      'poetry|python|poetry.lock|poetry.lock|.venv|yes|POETRY_VIRTUALENVS_IN_PROJECT=true poetry install'
+      'uv|python|pyproject.toml@tool\.uv|uv.lock|.venv|yes|uv sync'
+      'poetry|python|pyproject.toml@tool\.poetry|poetry.lock|.venv|yes|POETRY_VIRTUALENVS_IN_PROJECT=true poetry install'
+      'pip|python|requirements.txt|requirements.txt|.venv|yes|python3 -m venv .venv && .venv/bin/pip install -r requirements.txt'
+      'pip|python|pyproject.toml|pyproject.toml|.venv|yes|python3 -m venv .venv && .venv/bin/pip install .'
     )
 
     local _handled=" " _row name family marker lockfiles reuse_dir symlinkable install_cmd
     for _row in "${_rows[@]}"; do
       IFS='|' read -r name family marker lockfiles reuse_dir symlinkable install_cmd <<< "$_row"
-      [[ -f "$marker" ]] || continue                        # not this ecosystem
+      _tackle_dep_marker_present "$marker" || continue      # not this ecosystem
       case "$_handled" in *" $family "*) continue ;; esac    # family already handled
       _handled="$_handled$family "
 

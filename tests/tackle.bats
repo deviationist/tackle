@@ -290,20 +290,79 @@ _seed_js_repo() {
   [[ "$output" == *"npm"* ]]
 }
 
-@test "python: requirements.txt installs, never symlinks a .venv" {
-  write_install_stub pip .venv
+@test "python: symlinks an in-project .venv when the lockfile is unchanged" {
   git -C "$REPO" branch -D feature
-  printf 'requests==2.0\n' > "$REPO/requirements.txt"
-  git -C "$REPO" add -A
-  git -C "$REPO" commit -q -m deps
+  printf 'lock-v1\n' > "$REPO/uv.lock"
+  git -C "$REPO" add -A; git -C "$REPO" commit -q -m deps
   git -C "$REPO" branch feature
-  mkdir -p "$REPO/.venv/lib"                   # non-empty venv in main
+  mkdir -p "$REPO/.venv/bin"                    # non-empty in-project venv in main
+  printf '#!/x\n' > "$REPO/.venv/bin/python"
   cd "$REPO"
   run tackle feature --no-agent
   [ "$status" -eq 0 ]
-  [ ! -L "$BATS_TEST_TMPDIR/repo_feature/.venv" ]   # venvs are never relocatable
+  [ -L "$BATS_TEST_TMPDIR/repo_feature/.venv" ]                       # reused by symlink
+  [ -f "$BATS_TEST_TMPDIR/repo_feature/.venv/bin/python" ]           # resolves to main's
+  [[ "$output" == *".venv symlinked from main repo"* ]]
+}
+
+@test "python: installs (not symlinks) when the lockfile differs" {
+  write_install_stub uv .venv
+  git -C "$REPO" branch -D feature
+  printf 'lock-v1\n' > "$REPO/uv.lock"
+  git -C "$REPO" add -A; git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature                 # feature has lock-v1
+  printf 'lock-v2\n' > "$REPO/uv.lock"          # main now diverges
+  git -C "$REPO" add -A; git -C "$REPO" commit -q -m bump
+  mkdir -p "$REPO/.venv/bin"; printf 'x\n' > "$REPO/.venv/bin/python"
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ ! -L "$BATS_TEST_TMPDIR/repo_feature/.venv" ]    # lock differs → not reused
   run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
-  [[ "$output" == *"pip"* ]]
+  [[ "$output" == *"uv"* ]]
+}
+
+@test "python: detects uv from pyproject [tool.uv] even with a requirements.txt present" {
+  # The infrastructure case: [tool.uv] declared, no uv.lock, requirements.txt also
+  # present. Content-aware detection must pick uv, not fall through to pip.
+  write_install_stub uv .venv
+  git -C "$REPO" branch -D feature
+  printf '[project]\nname = "x"\n[tool.uv]\n' > "$REPO/pyproject.toml"
+  printf 'requests\n' > "$REPO/requirements.txt"
+  git -C "$REPO" add -A; git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [[ "$output" == *"uv"* ]]
+  [[ "$output" != *"pip"* ]]
+}
+
+@test "python: detects poetry from pyproject [tool.poetry]" {
+  write_install_stub poetry .venv
+  git -C "$REPO" branch -D feature
+  printf '[tool.poetry]\nname = "x"\n' > "$REPO/pyproject.toml"
+  git -C "$REPO" add -A; git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/repo_feature/.tackle-installed"
+  [[ "$output" == *"poetry"* ]]
+}
+
+@test "python: requirements.txt creates an isolated in-project .venv" {
+  git -C "$REPO" branch -D feature
+  : > "$REPO/requirements.txt"                  # empty → pip no-op, no network
+  git -C "$REPO" add -A; git -C "$REPO" commit -q -m deps
+  git -C "$REPO" branch feature
+  cd "$REPO"
+  run tackle feature --no-agent
+  [ "$status" -eq 0 ]
+  [ ! -L "$BATS_TEST_TMPDIR/repo_feature/.venv" ]           # a real venv, not a symlink
+  [ -x "$BATS_TEST_TMPDIR/repo_feature/.venv/bin/python" ] \
+    || [ -x "$BATS_TEST_TMPDIR/repo_feature/.venv/bin/python3" ]
 }
 
 @test "Bazel workspace short-circuits: no symlink, no install" {
