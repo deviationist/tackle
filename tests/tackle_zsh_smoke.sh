@@ -92,4 +92,28 @@ tackle --new cfgbranch --no-agent --trust
 [[ -f "$TMP/cfgrepo_cfgbranch/hook_ran.txt" ]] \
   || { print -r -- "FAIL: config setup hook did not run under zsh"; exit 1 }
 
-print -r -- "zsh smoke: OK (create + --done + dep-registry + project-config under zsh $ZSH_VERSION)"
+# ── Python content-aware detection under real zsh ────────────────────────────
+# The "file@section" marker (_tackle_dep_marker_present) uses ${spec%@*}/${spec#*@}
+# splitting + a grep — worth guarding under zsh. A stub uv proves the pyproject
+# [tool.uv] row is selected (over the also-present requirements.txt / pip row).
+cat > "$TMP/bin/uv" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p "$PWD/.venv/bin"; echo ran > "$PWD/.venv/.by-uv"
+EOF
+chmod +x "$TMP/bin/uv"
+git init -q "$TMP/pyrepo"
+git -C "$TMP/pyrepo" config user.email test@example.com
+git -C "$TMP/pyrepo" config user.name  tester
+printf '[project]\nname = "x"\n[tool.uv]\n' > "$TMP/pyrepo/pyproject.toml"
+printf 'requests\n' > "$TMP/pyrepo/requirements.txt"
+printf '.venv\n' > "$TMP/pyrepo/.gitignore"
+git -C "$TMP/pyrepo" add -A
+git -C "$TMP/pyrepo" commit -q -m init
+git -C "$TMP/pyrepo" branch feature
+
+cd "$TMP/pyrepo"
+tackle feature --no-agent
+[[ -f "$TMP/pyrepo_feature/.venv/.by-uv" ]] \
+  || { print -r -- "FAIL: pyproject [tool.uv] not detected under zsh (uv row not selected)"; exit 1 }
+
+print -r -- "zsh smoke: OK (create + --done + dep-registry + project-config + py-detect under zsh $ZSH_VERSION)"
